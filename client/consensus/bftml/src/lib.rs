@@ -44,7 +44,7 @@ use sc_network_gossip::{Validator, ValidationResult, TopicNotification};
 
 mod _app {
     use sp_application_crypto::{
-		app_crypto, sr25519, key_types::BFTML,
+	app_crypto, sr25519, key_types::BFTML,
     };
     app_crypto!(sr25519, BFTML);
 }
@@ -63,32 +63,32 @@ struct BftmlPreDigest {
 
 #[derive(derive_more::Display, Debug)]
 enum Error<B: BlockT> {
-	#[display(fmt = "Multiple BABE pre-runtime digests, rejecting!")]
-	MultiplePreRuntimeDigests,
-	#[display(fmt = "No BABE pre-runtime digest found")]
-	NoPreRuntimeDigest,
-	#[display(fmt = "Multiple BABE epoch change digests, rejecting!")]
-	MultipleEpochChangeDigests,
-	#[display(fmt = "Parent ({}) of {} unavailable. Cannot import", _0, _1)]
-	ParentUnavailable(B::Hash, B::Hash),
-	#[display(fmt = "Header {:?} has a bad seal", _0)]
-	HeaderBadSeal(B::Hash),
-	#[display(fmt = "Header {:?} is unsealed", _0)]
-	HeaderUnsealed(B::Hash),
-	#[display(fmt = "Bad signature on {:?}", _0)]
-	BadSignature(B::Hash),
-	#[display(fmt = "Invalid author: Expected secondary author: {:?}, got: {:?}.", _0, _1)]
-	InvalidAuthor(AuthorityId, AuthorityId),
-	#[display(fmt = "Could not fetch parent header: {:?}", _0)]
-	FetchParentHeader(sp_blockchain::Error),
-	#[display(fmt = "Block {} is not valid under any epoch.", _0)]
-	BlockNotValid(B::Hash),
-	#[display(fmt = "Parent block of {} has no associated weight", _0)]
-	ParentBlockNoAssociatedWeight(B::Hash),
-	#[display(fmt = "Checking inherents failed: {}", _0)]
-	CheckInherents(String),
-	Client(sp_blockchain::Error),
-	Runtime(sp_inherents::Error),
+    #[display(fmt = "Multiple BABE pre-runtime digests, rejecting!")]
+    MultiplePreRuntimeDigests,
+    #[display(fmt = "No BABE pre-runtime digest found")]
+    NoPreRuntimeDigest,
+    #[display(fmt = "Multiple BABE epoch change digests, rejecting!")]
+    MultipleEpochChangeDigests,
+    #[display(fmt = "Parent ({}) of {} unavailable. Cannot import", _0, _1)]
+    ParentUnavailable(B::Hash, B::Hash),
+    #[display(fmt = "Header {:?} has a bad seal", _0)]
+    HeaderBadSeal(B::Hash),
+    #[display(fmt = "Header {:?} is unsealed", _0)]
+    HeaderUnsealed(B::Hash),
+    #[display(fmt = "Bad signature on {:?}", _0)]
+    BadSignature(B::Hash),
+    #[display(fmt = "Invalid author: Expected secondary author: {:?}, got: {:?}.", _0, _1)]
+    InvalidAuthor(AuthorityId, AuthorityId),
+    #[display(fmt = "Could not fetch parent header: {:?}", _0)]
+    FetchParentHeader(sp_blockchain::Error),
+    #[display(fmt = "Block {} is not valid under any epoch.", _0)]
+    BlockNotValid(B::Hash),
+    #[display(fmt = "Parent block of {} has no associated weight", _0)]
+    ParentBlockNoAssociatedWeight(B::Hash),
+    #[display(fmt = "Checking inherents failed: {}", _0)]
+    CheckInherents(String),
+    Client(sp_blockchain::Error),
+    Runtime(sp_inherents::Error),
 }
 
 
@@ -106,6 +106,8 @@ pub enum BftmlChannelMsg {
     GossipMsgOutgoing(Vec<u8>),
 }
 
+type BlockProposal = BlockImportParams;
+
 
 //
 // Core bft consensus middle layer worker
@@ -122,15 +124,19 @@ pub struct BftmlWorker<B, I, E> {
     // gossip network message incoming channel
     gossip_incoming_end: UnboundedReceiver<TopicNotification>,
     // imported block channel rx, from block import handle
-    imported_block_rx: UnboundedReceiver<BlockImportParams>,
+    imported_block_rx: UnboundedReceiver<BlockProposal>,
     // substrate to consensus engine channel tx
-    tc_tx: UnboundedSender<BftmlChannelMsg>,
+    tc_tx: UnboundedSender<Vec<u8>>,
     // consensus engine to substrate channel rx
-    ts_rx: UnboundedReceiver<BftmlChannelMsg>,
-    // mint block channel rx
-    mb_rx: UnboundedReceiver<BftmlChannelMsg>,
+    ts_rx: UnboundedReceiver<Vec<u8>>,
+    // commit block channel rx
+    cb_rx: UnboundedReceiver<CommitBlockMsg>,
     // import block channel tx
-    ib_tx: UnboundedSender<BftmlChannelMsg>
+    ib_tx: UnboundedSender<BlockProposal>,
+    // ask proposal channel tx
+    ap_tx: UnboundedSender<String>,
+    // give proposal channel tx
+    gp_tx: UnboundedSender<String>,
 
 }
 
@@ -145,11 +151,13 @@ impl<B, I, E> BftmlWorker<B, I, E> where
 	client: Arc<Client>,
 	block_import: Arc<Mutex<I>>,
 	proposer_factory: E,
-	imported_block_rx: UnboundedReceiver<BlockImportParams>,
-	tc_tx: UnboundedSender<BftmlChannelMsg>,
-	ts_rx: UnboundedReceiver<BftmlChannelMsg>,
-	mb_rx: UnboundedReceiver<BftmlChannelMsg>,
-	ib_tx: UnboundedSender<BftmlChannelMsg>
+	imported_block_rx: UnboundedReceiver<BlockProposal>,
+	tc_tx: UnboundedSender<Vec<u8>>,
+	ts_rx: UnboundedReceiver<Vec<u8>>,
+	cb_rx: UnboundedReceiver<CommitBlockMsg>,
+	ib_tx: UnboundedSender<BlockProposal>,
+	ap_rx: UnboundedReceiver<String>,
+	gp_tx: UnboundedSender<BlockProposal>
     ) {
 
 	let gossip_engine = crate::gen::gen_gossip_engine();
@@ -165,8 +173,10 @@ impl<B, I, E> BftmlWorker<B, I, E> where
 	    imported_block_rx,
 	    tc_tx,
 	    ts_rx,
-	    mb_rx,
+	    cb_rx,
 	    ib_tx,
+	    ap_rx,
+	    gp_tx,
 	}
     }
 
@@ -253,6 +263,11 @@ impl<B, I, E> BftmlWorker<B, I, E> where
 	// Here, we'd better use block mode to finish this block minting.
 	proposing.wait();
     }
+
+    fn commit_block() {
+	// finish commiting block
+
+    }
 }
 
 
@@ -271,23 +286,22 @@ impl<B, I, E> Future for BftmlWorker<B, I, E> where
     type Error = io::Error;
 
     fn poll(&mut self) -> Poll<(), Self::Error> {
-	// receive mint block directive
-	match self.mb_rx.poll()? {
+	// receive ask proposal directive
+	match self.ap_rx.poll()? {
 	    Async::Ready(Some(msg)) => {
-		if let BftmlChannelMsg::MintBlock(authority_index) = msg {
-		    // mint block
-		    self.mint_block(authority_index);
-		}
+		// mint a new block on current local node
+		self.mint_block(authority_index);
 	    },
 	    _ => {}
 	}
 
-	// impoted block
+	// imported block
 	match self.imported_block_rx.poll()? {
 	    Async::Ready(Some(block)) => {
 		// stuff to do, do we need to wrap this struct BlockImportParams to a new type?
 		// send this block to consensus engine
-		self.ib_tx.unbounded_send(BftmlChannelMsg::ImportBlock(block));
+		self.ib_tx.unbounded_send(block);
+		self.gp_tx.unbounded_send(block);
 	    },
 	    _ => {}
 	}
@@ -298,10 +312,9 @@ impl<B, I, E> Future for BftmlWorker<B, I, E> where
 	    Async::Ready(Some(msg)) => {
 		// here, msg type is TopicNotification
 		let message = msg.message.clone();
-		let msg_to_send = BftmlChannelMsg::GossipMsgIncoming(message);
 
 		// send it to consensus engine
-		self.tc_tx.unbounded_send(msg_to_send);
+		self.tc_tx.unbounded_send(message);
 	    },
 	    _ => {}
 	}
@@ -309,17 +322,20 @@ impl<B, I, E> Future for BftmlWorker<B, I, E> where
 	// get msg from consensus engine
 	match self.ts_rx.poll()? {
 	    Async::Ready(Some(msg)) => {
-		match msg {
-		    BftmlChannelMsg::GossipMsgOutgoing(message) => {
-			// send it to gossip network
-			let topic = make_topic();
-			self.gossip_engine.gossip_message(topic, message, false);
-		    },
-		    _ => {}
-		}
+		let topic = make_topic();
+		self.gossip_engine.gossip_message(topic, msg, false);
 	    },
 	    _ => {}
 	}
+
+	match self.cb_rx.poll()? {
+	    Async::Ready(Some(commit_block_msg)) => {
+		// mint a new block on current local node
+		self.commit_block(commit_block_msg);
+	    },
+	    _ => {}
+	}
+
 
 	Ok(Async::NotReady)
     }
@@ -717,10 +733,10 @@ impl<Hash> CompatibleDigestItem for DigestItem<Hash> where
 pub mod gen {
 
     pub fn gen_consensus_msg_channels() -> (
-	UnboundedSender<BftmlChannelMsg>,
-	UnboundedReceiver<BftmlChannelMsg>,
-	UnboundedSender<BftmlChannelMsg>,
-	UnboundedReceiver<BftmlChannelMsg>
+	UnboundedSender<Vec<u8>>,
+	UnboundedReceiver<Vec<u8>>,
+	UnboundedSender<Vec<u8>>,
+	UnboundedReceiver<Vec<u8>>
     ){
 
 	// Consensus engine to substrate consensus msg channel
@@ -732,10 +748,23 @@ pub mod gen {
 	(tc_tx, tc_rx, ts_tx, ts_rx)
     }
 
-    pub fn gen_mint_block_channel() -> (UnboundedSender<BftmlChannelMsg>, UnboundedReceiver<BftmlChannelMsg>) {
-	let (mb_tx, mb_rx) = mpsc::unbounded();
+    pub fn gen_ask_proposal_channel() -> (UnboundedSender<BftmlChannelMsg>, UnboundedReceiver<BftmlChannelMsg>) {
+	let (ap_tx, ap_rx) = mpsc::unbounded();
 
-	(mb_tx, mb_rx)
+	(ap_tx, ap_rx)
+    }
+
+    pub fn gen_give_proposal_channel() -> (UnboundedSender<BftmlChannelMsg>, UnboundedReceiver<BftmlChannelMsg>) {
+	let (gp_tx, gp_rx) = mpsc::unbounded();
+
+	(gp_tx, gp_rx)
+    }
+
+
+    pub fn gen_commit_block_channel() -> (UnboundedSender<BftmlChannelMsg>, UnboundedReceiver<BftmlChannelMsg>) {
+	let (cb_tx, cb_rx) = mpsc::unbounded();
+
+	(cb_tx, cb_rx)
     }
 
     pub fn gen_import_block_channel() -> (UnboundedSender<BftmlChannelMsg>, UnboundedReceiver<BftmlChannelMsg>) {

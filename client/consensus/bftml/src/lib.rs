@@ -93,18 +93,6 @@ enum Error<B: BlockT> {
 
 
 
-// Bft consensus middle layer channel messages
-pub enum BftmlChannelMsg {
-    // block msg varaints
-    // u32, authority_index
-    MintBlock(u32),
-    // contains the block passed through
-    ImportBlock(BlockImportParams),
-    // gossip msg varaints
-    // the inner data is raw opaque u8 vector, parsed by high level consensus engine
-    GossipMsgIncoming(Vec<u8>),
-    GossipMsgOutgoing(Vec<u8>),
-}
 
 type BlockProposal = BlockImportParams;
 
@@ -748,26 +736,26 @@ pub mod gen {
 	(tc_tx, tc_rx, ts_tx, ts_rx)
     }
 
-    pub fn gen_ask_proposal_channel() -> (UnboundedSender<BftmlChannelMsg>, UnboundedReceiver<BftmlChannelMsg>) {
+    pub fn gen_ask_proposal_channel() -> (UnboundedSender<String>, UnboundedReceiver<String>) {
 	let (ap_tx, ap_rx) = mpsc::unbounded();
 
 	(ap_tx, ap_rx)
     }
 
-    pub fn gen_give_proposal_channel() -> (UnboundedSender<BftmlChannelMsg>, UnboundedReceiver<BftmlChannelMsg>) {
+    pub fn gen_give_proposal_channel() -> (UnboundedSender<BlockProposal>, UnboundedReceiver<BlockProposal>) {
 	let (gp_tx, gp_rx) = mpsc::unbounded();
 
 	(gp_tx, gp_rx)
     }
 
 
-    pub fn gen_commit_block_channel() -> (UnboundedSender<BftmlChannelMsg>, UnboundedReceiver<BftmlChannelMsg>) {
+    pub fn gen_commit_block_channel() -> (UnboundedSender<CommitBlockMsg>, UnboundedReceiver<CommitBlockMsg>) {
 	let (cb_tx, cb_rx) = mpsc::unbounded();
 
 	(cb_tx, cb_rx)
     }
 
-    pub fn gen_import_block_channel() -> (UnboundedSender<BftmlChannelMsg>, UnboundedReceiver<BftmlChannelMsg>) {
+    pub fn gen_import_block_channel() -> (UnboundedSender<BlockProposal>, UnboundedReceiver<BlockProposal>) {
 	let (ib_tx, ib_rx) = mpsc::unbounded();
 
 	(ib_tx, ib_rx)

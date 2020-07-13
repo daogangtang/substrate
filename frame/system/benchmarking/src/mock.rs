@@ -51,6 +51,7 @@ impl Dispatchable for Call {
 pub struct Test;
 
 impl frame_system::Trait for Test {
+	type BaseCallFilter = ();
 	type Origin = Origin;
 	type Index = AccountIndex;
 	type BlockNumber = BlockNumber;
@@ -74,6 +75,7 @@ impl frame_system::Trait for Test {
 	type AccountData = ();
 	type OnNewAccount = ();
 	type OnKilledAccount = ();
+	type SystemWeightInfo = ();
 }
 
 impl crate::Trait for Test {}

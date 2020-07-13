@@ -19,6 +19,7 @@
 //! In memory client backend
 
 use std::collections::HashMap;
+use std::ptr;
 use std::sync::Arc;
 use parking_lot::RwLock;
 use sp_core::{
@@ -113,6 +114,12 @@ pub struct Blockchain<Block: BlockT> {
 	storage: Arc<RwLock<BlockchainStorage<Block>>>,
 }
 
+impl<Block: BlockT> Default for Blockchain<Block> {
+	fn default() -> Self {
+		Self::new()
+	}
+}
+
 impl<Block: BlockT + Clone> Clone for Blockchain<Block> {
 	fn clone(&self) -> Self {
 		let storage = Arc::new(RwLock::new(self.storage.read().clone()));
@@ -191,11 +198,19 @@ impl<Block: BlockT> Blockchain<Block> {
 
 	/// Compare this blockchain with another in-mem blockchain
 	pub fn equals_to(&self, other: &Self) -> bool {
+		// Check ptr equality first to avoid double read locks.
+		if ptr::eq(self, other) {
+			return true;
+		}
 		self.canon_equals_to(other) && self.storage.read().blocks == other.storage.read().blocks
 	}
 
 	/// Compare canonical chain to other canonical chain.
 	pub fn canon_equals_to(&self, other: &Self) -> bool {
+		// Check ptr equality first to avoid double read locks.
+		if ptr::eq(self, other) {
+			return true;
+		}
 		let this = self.storage.read();
 		let other = other.storage.read();
 			this.hashes == other.hashes

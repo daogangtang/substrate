@@ -26,7 +26,7 @@ pub mod system;
 use sp_std::{prelude::*, marker::PhantomData};
 use codec::{Encode, Decode, Input, Error};
 
-use sp_core::{OpaqueMetadata, RuntimeDebug, ChangesTrieConfiguration};
+use sp_core::{offchain::KeyTypeId, ChangesTrieConfiguration, OpaqueMetadata, RuntimeDebug};
 use sp_application_crypto::{ed25519, sr25519, ecdsa, RuntimeAppPublic};
 use trie_db::{TrieMut, Trie};
 use sp_trie::PrefixedMemoryDB;
@@ -49,7 +49,11 @@ use sp_version::RuntimeVersion;
 pub use sp_core::hash::H256;
 #[cfg(any(feature = "std", test))]
 use sp_version::NativeVersion;
-use frame_support::{impl_outer_origin, parameter_types, weights::{Weight, RuntimeDbWeight}};
+use frame_support::{
+	impl_outer_origin, parameter_types,
+	traits::KeyOwnerProofSystem,
+	weights::{RuntimeDbWeight, Weight},
+};
 use sp_inherents::{CheckInherentsResult, InherentData};
 use cfg_if::cfg_if;
 
@@ -184,7 +188,7 @@ impl ExtrinsicT for Extrinsic {
 }
 
 impl sp_runtime::traits::Dispatchable for Extrinsic {
-	type Origin = ();
+	type Origin = Origin;
 	type Trait = ();
 	type Info = ();
 	type PostInfo = ();
@@ -194,10 +198,20 @@ impl sp_runtime::traits::Dispatchable for Extrinsic {
 }
 
 impl Extrinsic {
+	/// Convert `&self` into `&Transfer`.
+	///
+	/// Panics if this is no `Transfer` extrinsic.
 	pub fn transfer(&self) -> &Transfer {
+		self.try_transfer().expect("cannot convert to transfer ref")
+	}
+
+	/// Try to convert `&self` into `&Transfer`.
+	///
+	/// Returns `None` if this is no `Transfer` extrinsic.
+	pub fn try_transfer(&self) -> Option<&Transfer> {
 		match self {
-			Extrinsic::Transfer { ref transfer, .. } => transfer,
-			_ => panic!("cannot convert to transfer ref"),
+			Extrinsic::Transfer { ref transfer, .. } => Some(transfer),
+			_ => None,
 		}
 	}
 }
@@ -208,6 +222,8 @@ pub type AccountSignature = sr25519::Signature;
 pub type AccountId = <AccountSignature as Verify>::Signer;
 /// A simple hash type for all our hashing.
 pub type Hash = H256;
+/// The hashing algorithm used.
+pub type Hashing = BlakeTwo256;
 /// The block number type used in this runtime.
 pub type BlockNumber = u64;
 /// Index of a transaction.
@@ -219,7 +235,7 @@ pub type Digest = sp_runtime::generic::Digest<H256>;
 /// A test block.
 pub type Block = sp_runtime::generic::Block<Header, Extrinsic>;
 /// A test block's header.
-pub type Header = sp_runtime::generic::Header<BlockNumber, BlakeTwo256>;
+pub type Header = sp_runtime::generic::Header<BlockNumber, Hashing>;
 
 /// Run whatever tests we have.
 pub fn run_tests(mut input: &[u8]) -> Vec<u8> {
@@ -311,6 +327,9 @@ cfg_if! {
 				fn test_ecdsa_crypto() -> (ecdsa::AppSignature, ecdsa::AppPublic);
 				/// Run various tests against storage.
 				fn test_storage();
+				/// Test that ensures that we can call a function that takes multiple
+				/// arguments.
+				fn test_multiple_arguments(data: Vec<u8>, other: Vec<u8>, num: u32);
 			}
 		}
 	} else {
@@ -357,6 +376,9 @@ cfg_if! {
 				fn test_ecdsa_crypto() -> (ecdsa::AppSignature, ecdsa::AppPublic);
 				/// Run various tests against storage.
 				fn test_storage();
+				/// Test that ensures that we can call a function that takes multiple
+				/// arguments.
+				fn test_multiple_arguments(data: Vec<u8>, other: Vec<u8>, num: u32);
 			}
 		}
 	}
@@ -399,12 +421,13 @@ parameter_types! {
 }
 
 impl frame_system::Trait for Runtime {
+	type BaseCallFilter = ();
 	type Origin = Origin;
 	type Call = Extrinsic;
 	type Index = u64;
 	type BlockNumber = u64;
 	type Hash = H256;
-	type Hashing = BlakeTwo256;
+	type Hashing = Hashing;
 	type AccountId = u64;
 	type Lookup = IdentityLookup<Self::AccountId>;
 	type Header = Header;
@@ -422,6 +445,7 @@ impl frame_system::Trait for Runtime {
 	type AccountData = ();
 	type OnNewAccount = ();
 	type OnKilledAccount = ();
+	type SystemWeightInfo = ();
 }
 
 impl pallet_timestamp::Trait for Runtime {
@@ -429,6 +453,7 @@ impl pallet_timestamp::Trait for Runtime {
 	type Moment = u64;
 	type OnTimestampSet = ();
 	type MinimumPeriod = MinimumPeriod;
+	type WeightInfo = ();
 }
 
 parameter_types! {
@@ -443,6 +468,18 @@ impl pallet_babe::Trait for Runtime {
 	// are manually adding the digests. normally in this situation you'd use
 	// pallet_babe::SameAuthoritiesForever.
 	type EpochChangeTrigger = pallet_babe::ExternalTrigger;
+
+	type KeyOwnerProofSystem = ();
+
+	type KeyOwnerProof =
+		<Self::KeyOwnerProofSystem as KeyOwnerProofSystem<(KeyTypeId, AuthorityId)>>::Proof;
+
+	type KeyOwnerIdentification = <Self::KeyOwnerProofSystem as KeyOwnerProofSystem<(
+		KeyTypeId,
+		AuthorityId,
+	)>>::IdentificationTuple;
+
+	type HandleEquivocation = ();
 }
 
 /// Adds one to the given input and returns the final result.
@@ -466,7 +503,7 @@ fn code_using_trie() -> u64 {
 	let mut root = sp_std::default::Default::default();
 	let _ = {
 		let v = &pairs;
-		let mut t = TrieDBMut::<BlakeTwo256>::new(&mut mdb, &mut root);
+		let mut t = TrieDBMut::<Hashing>::new(&mut mdb, &mut root);
 		for i in 0..v.len() {
 			let key: &[u8]= &v[i].0;
 			let val: &[u8] = &v[i].1;
@@ -477,7 +514,7 @@ fn code_using_trie() -> u64 {
 		t
 	};
 
-	if let Ok(trie) = TrieDB::<BlakeTwo256>::new(&mdb, &root) {
+	if let Ok(trie) = TrieDB::<Hashing>::new(&mdb, &root) {
 		if let Ok(iter) = trie.iter() {
 			let mut iter_pairs = Vec::new();
 			for pair in iter {
@@ -638,6 +675,11 @@ cfg_if! {
 					test_read_storage();
 					test_read_child_storage();
 				}
+
+				fn test_multiple_arguments(data: Vec<u8>, other: Vec<u8>, num: u32) {
+					assert_eq!(&data[..], &other[..]);
+					assert_eq!(data.len(), num as usize);
+				}
 			}
 
 			impl sp_consensus_aura::AuraApi<Block, AuraId> for Runtime {
@@ -665,6 +707,22 @@ cfg_if! {
 
 				fn current_epoch_start() -> SlotNumber {
 					<pallet_babe::Module<Runtime>>::current_epoch_start()
+				}
+
+				fn submit_report_equivocation_unsigned_extrinsic(
+					_equivocation_proof: sp_consensus_babe::EquivocationProof<
+						<Block as BlockT>::Header,
+					>,
+					_key_owner_proof: sp_consensus_babe::OpaqueKeyOwnershipProof,
+				) -> Option<()> {
+					None
+				}
+
+				fn generate_key_ownership_proof(
+					_slot_number: sp_consensus_babe::SlotNumber,
+					_authority_id: sp_consensus_babe::AuthorityId,
+				) -> Option<sp_consensus_babe::OpaqueKeyOwnershipProof> {
+					None
 				}
 			}
 
@@ -859,6 +917,11 @@ cfg_if! {
 					test_read_storage();
 					test_read_child_storage();
 				}
+
+				fn test_multiple_arguments(data: Vec<u8>, other: Vec<u8>, num: u32) {
+					assert_eq!(&data[..], &other[..]);
+					assert_eq!(data.len(), num as usize);
+				}
 			}
 
 			impl sp_consensus_aura::AuraApi<Block, AuraId> for Runtime {
@@ -886,6 +949,22 @@ cfg_if! {
 
 				fn current_epoch_start() -> SlotNumber {
 					<pallet_babe::Module<Runtime>>::current_epoch_start()
+				}
+
+				fn submit_report_equivocation_unsigned_extrinsic(
+					_equivocation_proof: sp_consensus_babe::EquivocationProof<
+						<Block as BlockT>::Header,
+					>,
+					_key_owner_proof: sp_consensus_babe::OpaqueKeyOwnershipProof,
+				) -> Option<()> {
+					None
+				}
+
+				fn generate_key_ownership_proof(
+					_slot_number: sp_consensus_babe::SlotNumber,
+					_authority_id: sp_consensus_babe::AuthorityId,
+				) -> Option<sp_consensus_babe::OpaqueKeyOwnershipProof> {
+					None
 				}
 			}
 

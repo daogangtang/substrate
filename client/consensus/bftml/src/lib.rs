@@ -1,7 +1,6 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{self, Instant, Duration};
-
 use futures::prelude::*;
 use futures::future;
 use futures::sync::oneshot;
@@ -10,14 +9,10 @@ use tokio::timer::Delay;
 use parking_lot::{RwLock, Mutex};
 
 use codec::{Encode, Decode, Codec};
-
 use sp_core::{Blake2Hasher, H256, Pair};
 use sp_runtime::{
     generic::{BlockId, OpaqueDigestItemId},
-    traits::{
-                Block as BlockT, Header as HeaderT, Hash as HashT,
-                DigestItemFor, Zero,
-    },
+    traits::{Block, Header, Hash, DigestItemFor, Zero},
     Justification, ConsensusEngineId,
 };
 use sp_consensus::{
@@ -26,16 +21,6 @@ use sp_consensus::{
     SelectChain, SyncOracle, CanAuthorWith,
     import_queue::{Verifier, BasicQueue, CacheKeyId},
 };
-use sc_client_api::{
-    backend::{AuxStore, Backend},
-    call_executor::CallExecutor,
-    BlockchainEvents, ProvideUncles,
-};
-use sc_keystore::KeyStorePtr;
-
-//[XXX] Client has been removed by default, add it as a generic parameter
-use sc_client::Client;
-
 use sp_block_builder::BlockBuilder as BlockBuilderApi;
 use sp_blockchain::{
     Result as ClientResult, Error as ClientError, HeaderBackend,
@@ -43,6 +28,15 @@ use sp_blockchain::{
     well_known_cache_keys::{self, Id as CacheKeyId},
 };
 use sp_api::{ApiExt, ProvideRuntimeApi};
+use sp_timestamp::{InherentError, TimestampInherentData};
+use sc_client_api::{
+    backend::{AuxStore, Backend},
+    call_executor::CallExecutor,
+    BlockchainEvents, ProvideUncles,
+};
+use sc_keystore::KeyStorePtr;
+//[XXX] Client has been removed by default, add it as a generic parameter
+use sc_client::Client;
 use sc_network_gossip::{Validator, ValidationResult, TopicNotification};
 
 mod _app {
@@ -95,8 +89,6 @@ enum Error<B: BlockT> {
         Client(sp_blockchain::Error),
         Runtime(sp_inherents::Error),
 }
-
-
 
 // Bft consensus middle layer channel messages
 pub enum BftmlChannelMsg {
@@ -451,89 +443,162 @@ impl<B, E, Block, RA> Verifier<Block> for BftmlVerifier<B, E, Block, RA> where
 }
 
 
-
-pub struct BftmlBlockImport<B, E, Block: BlockT, RA, I> {
-    client: Arc<Client<B, E, Block, RA>>,
-    inner_block_import: I,
-    imported_block_tx: UnboundedSender<BlockImportParams>
+pub struct BftmlBlockImport<B: Block, C, I, S> {
+    client: Arc<C>,
+    inner: I,
+    select_chain: Option<S>,
+    inherent_data_providers: sp_inherents::InherentDataProviders,
+    check_inherents_after: <<B as Block>::Header as Header>::Number,
+    imported_block_tx: UnboundedSender<BlockImportParams>,
 }
 
-impl<B, E, Block: BlockT, RA, I> Clone for BftmlBlockImport<B, E, Block, RA, I> {
+impl<B: Block, C, I, S> Clone for BftmlBlockImport<B, C, I, S> {
     fn clone(&self) -> Self {
-        RhdBlockImport {
+        BftmlBlockImport {
             client: self.client.clone(),
-            inner_block_import: self.inner_block_import.clone(),
+            inner: self.inner.clone(),
+            select_chain: self.select_chain.clone(),
+            inherent_data_providers: self.inherent_data_providers.clone(),
+            check_inherents_after: self.check_inherents_after.clone(),
             imported_block_tx: self.imported_block_tx.clone()
         }
     }
 }
 
-impl<B, E, Block: BlockT, RA, I> BftmlBlockImport<B, E, Block, RA, I> {
-    fn new(
-        client: Arc<Client<B, E, Block, RA>>,
-        block_import: I,
-        imported_block_tx: UnboundedSender<BlockImportParams>
+impl<B, C, I, S> BftmlBlockImport<B, C, I, S>
+where
+    B: Block,
+    C: ProvideRuntimeApi<B> + Send + Sync + HeaderBackend<B> + AuxStore + ProvideCache<B> + BlockOf,
+    C::Api: BlockBuilderApi<B, Error = sp_blockchain::Error>,
+    I: BlockImport<B, Transaction = sp_api::TransactionFor<C, B>> + Send + Sync,
+    I::Error: Into<ConsensusError>,
+{
+    pub fn new(
+        client: Arc<C>,
+        inner: I,
+        select_chain: Option<S>,
+        inherent_data_providers: sp_inherents::InherentDataProviders,
+        check_inherents_after: <<B as BlockT>::Header as HeaderT>::Number,
+        imported_block_tx: UnboundedSender<BlockImportParams>,
     ) -> Self {
         BftmlBlockImport {
             client,
-            inner_block_import: block_import,
-            imported_block_tx
+            inner,
+            select_chain,
+            inherent_data_providers,
+            check_inherents_after,
+            imported_block_tx,
         }
     }
+
+	fn check_inherents(
+		&self,
+		block: B,
+		inherent_data: InherentData,
+		timestamp_now: u64,
+	) -> Result<(), Error<B>> {
+		const MAX_TIMESTAMP_DRIFT_SECS: u64 = 60;
+
+		if *block.header().number() < self.check_inherents_after {
+			return Ok(())
+		}
+
+		let inherent_res = self.client.runtime_api().check_inherents(
+			block,
+			inherent_data,
+		).map_err(Error::Client)?;
+
+		if !inherent_res.ok() {
+			inherent_res
+				.into_errors()
+				.try_for_each(|(i, e)| match InherentError::try_from(&i, &e) {
+					Some(InherentError::ValidAtTimestamp(timestamp)) => {
+						if timestamp > timestamp_now + MAX_TIMESTAMP_DRIFT_SECS {
+							return Err(Error::TooFarInFuture);
+						}
+
+						Ok(())
+					},
+					Some(InherentError::Other(e)) => Err(Error::Runtime(e)),
+					None => Err(Error::CheckInherents(
+						self.inherent_data_providers.error_to_string(&i, &e)
+					)),
+				})
+		} else {
+			Ok(())
+		}
+	}
 }
 
-impl<B, E, Block, RA, I> BlockImport<Block> for BftmlBlockImport<B, E, Block, RA, I> where
-    B: Backend<Block, Blake2Hasher> + 'static,
-    E: CallExecutor<Block, Blake2Hasher> + 'static + Clone + Send + Sync,
-    Block: BlockT<Hash=H256>,
-    RA: Send + Sync,
-    I: BlockImport<Block> + Send + Sync,
+impl<B, C, I, S> BlockImport<B> for BftmlBlockImport<B, C, I, S>
+where
+    B: Block,
+    C: ProvideRuntimeApi<B> + Send + Sync + HeaderBackend<B> + AuxStore + ProvideCache<B> + BlockOf,
+    C::Api: BlockBuilderApi<B, Error = sp_blockchain::Error>,
+    I: BlockImport<B, Transaction = sp_api::TransactionFor<C, B>> + Send + Sync,
     I::Error: Into<ConsensusError>,
+	S: SelectChain<B>,
 {
-    type Error = ConsensusError;
+	type Error = ConsensusError;
+	type Transaction = sp_api::TransactionFor<C, B>;
 
     fn check_block(
         &mut self,
-        block: BlockCheckParams<Block>,
+        block: BlockCheckParams<B>,
     ) -> Result<ImportResult, Self::Error> {
-        self.inner.check_block(block)
-            //.map_err(Into::into)
+        self.inner.check_block(block).map_err(Into::into)
     }
 
     fn import_block(
         &mut self,
-        mut block: BlockImportParams<Block>,
+        mut block: BlockImportParams<B, Self::Transaction>,
         new_cache: HashMap<CacheKeyId, Vec<u8>>,
     ) -> Result<ImportResult, Self::Error> {
 
-        let hash = block.post_header().hash();
-        let number = block.header.number().clone();
+		let best_hash = match self.select_chain.as_ref() {
+			Some(select_chain) => select_chain.best_chain()
+				.map_err(|e| format!("Fetch best chain failed via select chain: {:?}", e))?
+				.hash(),
+			None => self.client.info().best_hash,
+		};
 
-        // early exit if block already in chain, otherwise the check for
-        // epoch changes will error when trying to re-import an epoch change
-        match self.client.status(BlockId::Hash(hash)) {
-            Ok(sp_blockchain::BlockStatus::InChain) => return Ok(ImportResult::AlreadyInChain),
-            Ok(sp_blockchain::BlockStatus::Unknown) => {},
-            Err(e) => return Err(ConsensusError::ClientImport(e.to_string())),
-        }
+		if let Some(inner_body) = block.body.take() {
+			let inherent_data = self.inherent_data_providers
+				.create_inherent_data().map_err(|e| e.into_string())?;
+			let timestamp_now = inherent_data.timestamp_inherent_data().map_err(|e| e.into_string())?;
 
-        let pre_digest = find_pre_digest::<Block>(&block.header)
-            .expect("valid bftml headers must contain a predigest; \
-                     header has been already verified; qed");
-        let parent_hash = *block.header.parent_hash();
-        let parent_header = self.client.header(&BlockId::Hash(parent_hash))
-            .map_err(|e| ConsensusError::ChainLookup(e.to_string()))?
-            .ok_or_else(|| ConsensusError::ChainLookup(babe_err(
-                Error::<Block>::ParentUnavailable(parent_hash, hash)
-            ).into()))?;
+			let check_block = B::new(block.header.clone(), inner_body);
 
+			self.check_inherents(
+				check_block.clone(),
+				inherent_data,
+				timestamp_now
+			)?;
 
-        let import_result = self.inner_block_import.import_block(block.clone(), new_cache);
+			block.body = Some(check_block.deconstruct().1);
+		}
 
-        // send block to channel
-        self.imported_block_tx.unbounded_send(block);
+		let _inner_seal = match block.post_digests.last() {
+			Some(DigestItem::Seal(id, seal)) => {
+				if id == &BFTML_ENGINE_ID {
+					seal.clone()
+				} else {
+					return Err(Error::<B>::WrongEngine(*id).into())
+				}
+			},
+			_ => return Err(Error::<B>::HeaderUnsealed(block.header.hash()).into()),
+		};
 
-        import_result.map_err(Into::into)
+        // TODO: verify inner_seal
+
+		if block.fork_choice.is_none() {
+			block.fork_choice = Some(ForkChoiceStrategy::Custom(true));
+		}
+
+        // send imported block to upper channel
+        self.imported_block_tx.unbounded_send(block.clone());
+
+		self.inner.import_block(block, new_cache).map_err(Into::into)
     }
 }
 

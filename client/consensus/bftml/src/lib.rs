@@ -391,54 +391,57 @@ impl<Block: BlockT> sc_network_gossip::Validator<Block> for GossipValidator<Bloc
 //
 // Stuff must be implmented: Verifier, BlockImport, ImportQueue
 //
-pub struct BftmlVerifier<B, E, Block: BlockT, RA> {
-    client: Arc<Client<B, E, Block, RA>>,
+pub struct BftmlVerifier<B: Block> {
+	_marker: PhantomData<B>,
 }
 
-impl<B, E, Block, RA> Verifier<Block> for BftmlVerifier<B, E, Block, RA> where
-    B: Backend<Block, Blake2Hasher> + 'static,
-    E: CallExecutor<Block, Blake2Hasher> + 'static + Clone + Send + Sync,
-    Block: BlockT<Hash=H256>,
-    RA: Send + Sync,
-{
+impl<B: Block> BftmlVerifier<B> {
+	pub fn new() -> Self {
+		Self { _marker: PhantomData }
+	}
+
+	fn check_header(
+		&self,
+		mut header: B::Header,
+	) -> Result<(B::Header, DigestItem<B::Hash>), Error<B>>	{
+		let hash = header.hash();
+
+		let (seal, inner_seal) = match header.digest_mut().pop() {
+			Some(DigestItem::Seal(id, seal)) => {
+				if id == BFTML_ENGINE_ID{
+					(DigestItem::Seal(id, seal.clone()), seal)
+				} else {
+					return Err(Error::WrongEngine(id))
+				}
+			},
+			_ => return Err(Error::HeaderUnsealed(hash)),
+		};
+
+		let _pre_hash = header.hash();
+        // TODO: check pre_hash
+
+		Ok((header, seal))
+	}
+}
+
+impl<B: Block> Verifier<B> for BftmlVerifier<B> {
     fn verify(
         &mut self,
         origin: BlockOrigin,
         header: Block::Header,
         justification: Option<Justification>,
         mut body: Option<Vec<Block::Extrinsic>>,
-    ) -> Result<(BlockImportParams<Block>, Option<Vec<(CacheKeyId, Vec<u8>)>>), String> {
+    ) -> Result<(BlockImportParams<B, ()>, Option<Vec<(CacheKeyId, Vec<u8>)>>), String> {
+		let hash = header.hash();
+		let (checked_header, seal) = self.check_header(header)?;
 
-        let pre_digest = find_pre_digest::<Block>(&header)?;
+		let mut import_block = BlockImportParams::new(origin, checked_header);
+		import_block.post_digests.push(seal);
+		import_block.body = body;
+		import_block.justification = justification;
+		import_block.post_hash = Some(hash);
 
-        let v_params = VerificationParams {
-            header: header.clone(),
-            pre_digest: Some(pre_digest.clone()),
-        };
-
-        let checked_result = check_header::<Block>(v_params)?;
-        match checked_result {
-            CheckedHeader::Checked(pre_header, verified_info) => {
-                let block_import_params = BlockImportParams {
-                    origin,
-                    header: pre_header,
-                    post_digests: vec![verified_info.seal],
-                    body,
-                    // TODO: need set true? for instant finalization
-                    finalized: false,
-                    justification,
-                    auxiliary: Vec::new(),
-                    fork_choice: ForkChoiceStrategy::LongestChain,
-                    allow_missing_state: false,
-                    import_existing: false,
-                };
-
-                Ok((block_import_params, Default::default()))
-            },
-            CheckedHeader::NotChecked => {
-                Err("Verify failed!")
-            }
-        }
+		Ok((import_block, None))
     }
 }
 

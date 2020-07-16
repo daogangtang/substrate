@@ -350,7 +350,7 @@ use sc_bftml::gen;
 // We must use some basic types defined in Substrate, imported and use here
 // We can specify and wrap all these types in bftml, and import them from bftml module
 // to reduce noise on your eye
-pub fn gen_rhd_worker_pair<B, E, I>(
+pub fn make_rhd_worker_pair<B, E, I>(
     client: E,
     block_import: I,
     proposer_factory: E::Proposer,

@@ -325,11 +325,6 @@ impl<B, I, E> Future for BftmlWorker<B, I, E> where
 
 
 
-// /// Create a unique topic for a round and set-id combo.
-// pub fn round_topic<B: BlockT>(round: RoundNumber, set_id: SetIdNumber) -> B::Hash {
-//     <<B::Header as HeaderT>::Hashing as HashT>::hash(format!("{}-{}", set_id, round).as_bytes())
-// }
-
 pub fn make_topic<B: BlockT>() -> B::Hash {
     <<B::Header as HeaderT>::Hashing as HashT>::hash(format!("topic-{}", "bftmlgossip").as_bytes())
 }
@@ -605,188 +600,56 @@ where
     }
 }
 
-pub type ImportedBlockLink = mpsc::UnboundedReceiver<BlockImportParams>;
+/// Register the BFTML inherent data provider, if not registered already.
+/// only use timestamp inherent now
+pub fn register_bftml_inherent_data_provider(
+	inherent_data_providers: &InherentDataProviders,
+) -> Result<(), sp_consensus::Error> {
+	if !inherent_data_providers.has_provider(&sp_timestamp::INHERENT_IDENTIFIER) {
+		inherent_data_providers
+			.register_provider(sp_timestamp::InherentDataProvider)
+			.map_err(Into::into)
+			.map_err(sp_consensus::Error::InherentData)
+	} else {
+		Ok(())
+	}
+}
 
-pub fn gen_block_import_handle<B, E, Block: BlockT<Hash=H256>, RA, I>(
-    client: Arc<Client<B, E, Block, RA>>,
-) -> ClientResult<(RhdBlockImport<B, E, Block, RA, I>, ImportedBlockLink)> where
-    B: Backend<Block, Blake2Hasher>,
-    E: CallExecutor<Block, Blake2Hasher> + Send + Sync,
-    RA: Send + Sync,
-    I: BlockImport<Block> + Send + Sync,
-    I::Error: Into<ConsensusError>,
+/// The PoW import queue type.
+pub type BftmlImportQueue<B, Transaction> = BasicQueue<B, Transaction>;
+
+/// Generate a import queue for Bftml engine.
+pub fn make_import_queue<B, Transaction>(
+	block_import: BoxBlockImport<B, Transaction>,
+	justification_import: Option<BoxJustificationImport<B>>,
+	finality_proof_import: Option<BoxFinalityProofImport<B>>,
+	inherent_data_providers: InherentDataProviders,
+	spawner: &impl sp_core::traits::SpawnNamed,
+	registry: Option<&Registry>,
+) -> Result<
+	BftmlImportQueue<B, Transaction>,
+	sp_consensus::Error
+> where
+	B: Block,
+	Transaction: Send + Sync + 'static,
 {
+	register_bftml_inherent_data_provider(&inherent_data_providers)?;
 
-    let default_block_import = client.clone();
+	let verifier = BftmlVerifier::new();
 
-    let (imported_block_tx, imported_block_rx) = crate::gen::gen_imported_block_link();
-
-    let import_handle = BftmlBlockImport::new(
-        client: client.clone(),
-        inner_block_import: default_block_import,
-        imported_block_tx
-    );
-
-    Ok((import_handle, imported_block_rx))
+	Ok(BasicQueue::new(
+		verifier,
+		block_import,
+		justification_import,
+		finality_proof_import,
+		spawner,
+		registry,
+	))
 }
 
-
-
-/// The Bftml import queue type.
-pub type BftmlImportQueue<B> = BasicQueue<B>;
-
-pub fn gen_import_queue<B, E, Block: BlockT<Hash=H256>, RA, I>(
-    client: Arc<Client<B, E, Block, RA>>,
-    block_import: I,
-) -> ClientResult<BftmlImportQueue<Block>> where
-    B: Backend<Block, Blake2Hasher> + 'static,
-    E: CallExecutor<Block, Blake2Hasher> + Clone + Send + Sync + 'static,
-    RA: Send + Sync + 'static,
-    I: BlockImport<Block,Error=ConsensusError> + Send + Sync + 'static,
-{
-
-    let verifier = BftmlVerifier {
-        client: client.clone(),
-    };
-
-    let justification_import = None;
-    let finality_proof_import = None;
-
-    Ok(BasicQueue::new(
-        verifier,
-        Box::new(block_import),
-        justification_import,
-        finality_proof_import,
-    ))
-}
-
-
-//
-// Helper Function
-//
-fn get_authorities<A, B, C>(client: &C, at: &BlockId<B>) -> Result<Vec<A>, ConsensusError> where
-    A: Codec,
-    B: BlockT,
-    C: ProvideRuntimeApi + BlockOf + ProvideCache<B>,
-{
-    client
-        .cache()
-        .and_then(|cache| cache
-                  .get_at(&well_known_cache_keys::AUTHORITIES, at)
-                  .and_then(|(_, _, v)| Decode::decode(&mut &v[..]).ok())
-        )
-        .ok_or_else(|| sp_consensus::Error::InvalidAuthoritiesSet.into())
-}
-
-
-pub enum CheckedHeader<H, S> {
-    Checked(H, S),
-    NotChecked
-}
-
-struct VerificationParams<B: BlockT> {
-    pub header: B::Header,
-    pub pre_digest: Option<BftmlPreDigest>,
-}
-
-struct VerifiedHeaderInfo<B: BlockT> {
-    pub pre_digest: DigestItemFor<B>,
-    pub seal: DigestItemFor<B>,
-    pub author: AuthorityId,
-}
-
-fn check_header<B: BlockT + Sized>(
-    params: VerificationParams<B>,
-) -> Result<CheckedHeader<B::Header, VerifiedHeaderInfo<B>>, Error<B>> where
-    DigestItemFor<B>: CompatibleDigestItem,
-{
-    let VerificationParams {
-        mut header,
-        pre_digest,
-    } = params;
-
-    //let hash = header.hash();
-    let parent_hash = *header.parent_hash();
-    let authorities = get_authorities(self.client.as_ref(), &BlockId::Hash(parent_hash))
-        .map_err(|e| format!("Could not fetch authorities at {:?}: {:?}", parent_hash, e))?;
-
-    let author = match authorities.get(pre_digest.authority_index() as usize) {
-        Some(author) => author.0.clone(),
-        None => return Err(Error::SlotAuthorNotFound),
-    };
-
-    let seal = match header.digest_mut().pop() {
-        Some(x) => x,
-        None => return Err(Error::HeaderUnsealed(header.hash())),
-    };
-
-    let info = VerifiedHeaderInfo {
-        pre_digest: CompatibleDigestItem::bftml_pre_digest(pre_digest),
-        seal,
-        author,
-    };
-    Ok(CheckedHeader::Checked(header, info))
-}
-
-fn find_pre_digest<B: BlockT>(header: &B::Header) -> Result<BftmlPreDigest, Error<B>>
-{
-    // genesis block doesn't contain a pre digest so let's generate a
-    // dummy one to not break any invariants in the rest of the code
-    if header.number().is_zero() {
-        return Ok(BftmlPreDigest {
-            authority_index: 0,
-        });
-    }
-
-    let mut pre_digest: Option<_> = None;
-    for log in header.digest().logs() {
-        trace!(target: "bftml", "Checking log {:?}, looking for pre runtime digest", log);
-        match (log.as_bftml_pre_digest(), pre_digest.is_some()) {
-            (Some(_), true) => return Err(Error::MultiplePreRuntimeDigests),
-            (None, _) => trace!(target: "bftml", "Ignoring digest not meant for us"),
-            (s, false) => pre_digest = s,
-        }
-    }
-    pre_digest.ok_or_else(|| Error::NoPreRuntimeDigest)
-}
-
-/// A digest item which is usable with Bftml consensus.
-#[cfg(feature = "std")]
-pub trait CompatibleDigestItem: Sized {
-        fn bftml_pre_digest(seal: BftmlPreDigest) -> Self;
-        fn as_bftml_pre_digest(&self) -> Option<BftmlPreDigest>;
-        fn bftml_seal(signature: AuthoritySignature) -> Self;
-        // fn as_bftml_seal(&self) -> Option<AuthoritySignature>;
-}
-
-#[cfg(feature = "std")]
-impl<Hash> CompatibleDigestItem for DigestItem<Hash> where
-    Hash: Debug + Send + Sync + Eq + Clone + Codec + 'static
-{
-    fn bftml_pre_digest(digest: BftmlPreDigest) -> Self {
-        DigestItem::PreRuntime(BFTML_ENGINE_ID, digest.encode())
-    }
-
-    fn as_bftml_pre_digest(&self) -> Option<BftmlPreDigest> {
-        self.try_to(OpaqueDigestItemId::PreRuntime(&BFTML_ENGINE_ID))
-    }
-
-    fn bftml_seal(signature: AuthoritySignature) -> Self {
-        DigestItem::Seal(BFTML_ENGINE_ID, signature.encode())
-    }
-
-    // fn as_bftml_seal(&self) -> Option<AuthoritySignature> {
-    //	self.try_to(OpaqueDigestItemId::Seal(&BFTML_ENGINE_ID))
-    // }
-
-}
-
-
-
-
-//
+// ===============
 // gen module, including all generating methods about
-//
+// ===============
 pub mod gen {
 
     pub fn gen_consensus_msg_channels() -> (
@@ -823,16 +686,6 @@ pub mod gen {
         (imported_block_tx, imported_block_rx)
     }
 
-
-    // pub fn gen_proposer_factory(client: Arc<Client>, ) -> ProposerFactory {
-    //	let proposer_factory = sc_basic_authority::ProposerFactory {
-    //	    client: service.client(),
-    //	    transaction_pool: service.transaction_pool(),
-    //	};
-
-    //	proposer_factory
-    // }
-
     pub fn<B, S, H> gen_gossip_engine(
         network: Arc<NetworkService<B, S, H>>,
         executor: &impl futures03::task::Spawn,)
@@ -862,31 +715,23 @@ pub mod gen {
 
     pub fn<B> gen_gossip_incoming_end(&gossip_engine: GossipEngine<B>, topic: B::Hash) -> mpsc::UnboundedReceiver<TopicNotification> {
         let gossip_incoming_end = gossip_engine.messages_for(topic);
-
-        // We shall put these biz to upper level consensus engine implementation
-        // .map(|item| Ok::<_, ()>(item))
-            // .filter_map(|notification| {
-            //	let decoded = GossipMessage::<B>::decode(&mut &notification.message[..]);
-            //	if let Err(ref e) = decoded {
-            //	    debug!(target: "afg", "Skipping malformed message {:?}: {}", notification, e);
-            //	}
-            //	decoded.ok()
-            // })
-            // .and_then(move |msg| {
-            //	match msg {
-            //	    GossipMessage::Vote(msg) => {
-            //	    }
-            //	    _ => {
-            //		debug!(target: "afg", "Skipping unknown message type");
-            //		return Ok(None);
-            //	    }
-            //	}
-            // })
-            // .filter_map(|x| x)
-            // .map_err(|()| Error::Network(format!("Failed to receive message on unbounded stream")));
-
         gossip_incoming_end
     }
+}
 
-
+// ===============
+// Helper Function
+// ===============
+fn get_authorities<A, B, C>(client: &C, at: &BlockId<B>) -> Result<Vec<A>, ConsensusError> where
+    A: Codec,
+    B: BlockT,
+    C: ProvideRuntimeApi + BlockOf + ProvideCache<B>,
+{
+    client
+        .cache()
+        .and_then(|cache| cache
+                  .get_at(&well_known_cache_keys::AUTHORITIES, at)
+                  .and_then(|(_, _, v)| Decode::decode(&mut &v[..]).ok())
+        )
+        .ok_or_else(|| sp_consensus::Error::InvalidAuthoritiesSet.into())
 }

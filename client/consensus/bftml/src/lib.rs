@@ -1,8 +1,12 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{self, Instant, Duration};
-use futures::prelude::*;
-use futures::future;
+use std::pin::Pin;
+use futures::{
+    Future, Stream,
+    task::{Context, Poll}
+    mpsc::{UnboundedSender, UnboundedReceiver, Sender, Receiver},
+};
 use futures::sync::oneshot;
 use tokio::runtime::TaskExecutor;
 use tokio::timer::Delay;
@@ -11,14 +15,14 @@ use parking_lot::{RwLock, Mutex};
 use codec::{Encode, Decode, Codec};
 use sp_core::{Blake2Hasher, H256, Pair};
 use sp_runtime::{
-    generic::{BlockId, OpaqueDigestItemId},
-    traits::{Block, Header, Hash, DigestItemFor, Zero},
+    generic::{BlockId, Digest, DigestItem},
+    traits::{Block as BlockT, Header as HeaderT, Hash as HashT, DigestItemFor, Zero},
     Justification, ConsensusEngineId,
 };
 use sp_consensus::{
     self, BlockImport, Environment, Proposer, BlockCheckParams, ForkChoiceStrategy,
     BlockImportParams, BlockOrigin, ImportResult, Error as ConsensusError,
-    SelectChain, SyncOracle, CanAuthorWith,
+    SelectChain, SyncOracle, CanAuthorWith, RecordProof,
     import_queue::{Verifier, BasicQueue, CacheKeyId},
 };
 use sp_block_builder::BlockBuilder as BlockBuilderApi;
@@ -35,13 +39,12 @@ use sc_client_api::{
     BlockchainEvents, ProvideUncles,
 };
 use sc_keystore::KeyStorePtr;
-//[XXX] Client has been removed by default, add it as a generic parameter
-use sc_client::Client;
-use sc_network_gossip::{Validator, ValidationResult, TopicNotification};
+use sc_network::NetworkService;
+use sc_network_gossip::{GossipEngine, Validator, ValidatorContext, ValidationResult, TopicNotification};
 
 mod _app {
     use sp_application_crypto::{
-        //[XXX]: BFTML was added into sp_core::crypto::key_types;
+        //[XXX]: ensure BFTML was added into sp_core::crypto::key_types;
         app_crypto, sr25519, key_types::BFTML,
     };
     app_crypto!(sr25519, BFTML);
@@ -52,12 +55,8 @@ pub type AuthorityPair = _app::Pair;
 pub type AuthoritySignature = _app::Signature;
 pub type AuthorityId = _app::Public;
 // ConsensusEngineId type is: [u8; 4];
-pub const BFTML_ENGINE_ID: ConsensusEngineId = b"BFTE";
+pub const BFTML_ENGINE_ID: ConsensusEngineId = b"BFTM";
 
-
-struct BftmlPreDigest {
-    authority_index: u32
-}
 
 
 #[derive(derive_more::Display, Debug)]
@@ -90,66 +89,87 @@ enum Error<B: BlockT> {
         Runtime(sp_inherents::Error),
 }
 
+// struct to send to caller layer
+pub struct BftProposal {
+    // TODO: ...   
+}
+
+
 // Bft consensus middle layer channel messages
 pub enum BftmlChannelMsg {
     // block msg varaints
     // u32, authority_index
     MintBlock(u32),
-    // contains the block passed through
-    ImportBlock(BlockImportParams),
     // gossip msg varaints
     // the inner data is raw opaque u8 vector, parsed by high level consensus engine
     GossipMsgIncoming(Vec<u8>),
     GossipMsgOutgoing(Vec<u8>),
+    AskProposal(u32),
+    // contains the block passed through
+    ImportBlock(BftProposal),
+    GiveProposal(BftProposal),
+    // commit this block
+    CommitBlock(BftProposal),
 }
 
+type GossipMsgArrived = TopicNotification;
 
 //
 // Core bft consensus middle layer worker
 //
-pub struct BftmlWorker<B, I, E> {
+pub struct BftmlWorker<B, C, I, E> {
     // hold a ref to substrate client
-    client: Arc<Client>,
+    client: Arc<C>,
     // hold a ref to substrate block import instance
-    block_import: Arc<Mutex<I>>,
+    block_import: Arc<I>,
     // proposer for new block
     proposer_factory: E,
+
     // instance of the gossip network engine
     gossip_engine: GossipEngine<B>,
     // gossip network message incoming channel
-    gossip_incoming_end: UnboundedReceiver<TopicNotification>,
+    gossip_incoming_end: Receiver<GossipMsgArrived>,
+
     // imported block channel rx, from block import handle
-    imported_block_rx: UnboundedReceiver<BlockImportParams>,
+    imported_block_rx: UnboundedReceiver<BftProposal>,
+
     // substrate to consensus engine channel tx
     tc_tx: UnboundedSender<BftmlChannelMsg>,
     // consensus engine to substrate channel rx
     ts_rx: UnboundedReceiver<BftmlChannelMsg>,
-    // mint block channel rx
-    mb_rx: UnboundedReceiver<BftmlChannelMsg>,
-    // import block channel tx
-    ib_tx: UnboundedSender<BftmlChannelMsg>
+    // commit block channel rx
+    cb_rx: UnboundedReceiver<BftmlChannelMsg>,
+    // ask a proposal rx
+    ap_rx: UnboundedSender<BftmlChannelMsg>,
+    // generate a proposal tx
+    gp_tx: UnboundedSender<BftmlChannelMsg>,
 
 }
 
 
-impl<B, I, E> BftmlWorker<B, I, E> where
+impl<B, C, I, E, SO, S, CAW> BftmlWorker<B, C, I, E, SO, S, CAW> where
     B: BlockT + Clone + Eq,
-    B::Hash: ::std::hash::Hash,
+	C: HeaderBackend<B> + AuxStore + ProvideRuntimeApi<B> + 'static,
     I: BlockImport<B>,
-    E: Environment<B> + Send + Sync
+    E: Environment<B> + Send + Sync,
+	SO: SyncOracle + Send + Sync + 'static,
+	S: SelectChain<B> + 'static,
+	CAW: CanAuthorWith<B> + Send + Sync + 'static,
 {
     pub fn new(
-        client: Arc<Client>,
+        client: Arc<C>,
+        network: SO,  // sync_oracle is also network
         block_import: Arc<Mutex<I>>,
         proposer_factory: E,
-        imported_block_rx: UnboundedReceiver<BlockImportParams>,
+        imported_block_rx: UnboundedReceiver<BftProposal>,
         tc_tx: UnboundedSender<BftmlChannelMsg>,
         ts_rx: UnboundedReceiver<BftmlChannelMsg>,
-        mb_rx: UnboundedReceiver<BftmlChannelMsg>,
-        ib_tx: UnboundedSender<BftmlChannelMsg>
+        cb_rx: UnboundedReceiver<BftmlChannelMsg>,
+        ap_rx: UnboundedReceiver<BftmlChannelMsg>,
+        gp_tx: UnboundedSender<BftmlChannelMsg>
     ) {
 
-        let gossip_engine = crate::gen::gen_gossip_engine();
+        let gossip_engine = crate::gen::gen_gossip_engine(network.clone());
         let topic = make_topic();
         let gossip_incoming_end = crate::gen::gen_gossip_incoming_end(&gossip_engine, topic);
 
@@ -162,154 +182,170 @@ impl<B, I, E> BftmlWorker<B, I, E> where
             imported_block_rx,
             tc_tx,
             ts_rx,
-            mb_rx,
-            ib_tx,
+            cb_rx,
+            ap_rx,
+            gp_tx,
         }
     }
 
-    fn proposer(&mut self, block: &B::Header) -> Result<E::Proposer, sp_consensus::Error> {
-        self.proposer_factory.init(block).map_err(|e| {
-            sp_consensus::Error::ClientImport(format!("{:?}", e))
-        })
-    }
+    fn make_proposal(
+        &mut self, 
+        authority_index: u32, 
+	    client: &C,
+        sync_oracle: &mut SO, 
+        select_chain: Option<&S>,
+        inherent_data_providers: &sp_inherents::InherentDataProviders,
+        can_author_with: &CAW,) -> Result<(), Error<B>> {
 
-    fn mint_block(&mut self, authority_index: u32) {
-        let chain_head = match self.client.best_chain() {
-            Ok(x) => x,
-            Err(e) => {
-                // TODO:
-                return;
+        'outer: loop {
+            if sync_oracle.is_major_syncing() {
+                debug!(target: "bftml", "Skipping proposal due to sync.");
+                std::thread::sleep(std::time::Duration::new(1, 0));
+                continue 'outer
             }
-        };
 
-        // TODO: error handling
-        let proposer = self.proposer(&chain_head).unwrap();
+            let (best_hash, best_header) = match select_chain {
+                Some(select_chain) => {
+                    let header = select_chain.best_chain()
+                        .map_err(Error::BestHeaderSelectChain)?;
+                    let hash = header.hash();
+                    (hash, header)
+                },
+                None => {
+                    let hash = client.info().best_hash;
+                    let header = client.header(BlockId::Hash(hash))
+                        .map_err(Error::BestHeader)?
+                        .ok_or(Error::NoBestHeader)?;
+                    (hash, header)
+                },
+            };
+		
+            if let Err(err) = can_author_with.can_author_with(&BlockId::Hash(best_hash)) {
+                warn!(
+                    target: "bftml",
+                    "Skipping proposal `can_author_with` returned: {} \
+                    Probably a node update is required!",
+                    err,
+                    );
+                std::thread::sleep(std::time::Duration::from_secs(1));
+                continue 'outer
+            }
 
-        // assign emplty values now
-        let inherent_data = InherentData::new();
-        // TODO: could emply value be ok?
-        let digests = sp_runtime::generic::Digest {
-            logs: Vec::new()
-        };
-        let duration = time::Duration::seconds(12);
+            // Note: use `futures` v0.3.5
+            let proposer = futures::executor::block_on(self.proposer_factory.init(&best_header))
+                .map_err(|e| Error::Environment(format!("{:?}", e)))?;
 
-        // make a proposal
-        let proposing = proposer.propose(inherent_data, digests, duration)
-            .map_err(|e| sp_consensus::Error::ClientImport(format!("{:?}", e)));;
+            let inherent_data = inherent_data_providers
+                .create_inherent_data().map_err(Error::CreateInherents)?;
+            let mut inherent_digest = Digest::default();
+//            if let Some(preruntime) = &preruntime {
+//                inherent_digest.push(DigestItem::PreRuntime(POW_ENGINE_ID, preruntime.to_vec()));
+//            }
+            // Give max 10 seconds to build block
+            let build_time = std::time::Duration::new(10, 0);
+            let proposal = futures::executor::block_on(proposer.propose(
+                    inherent_data,
+                    inherent_digest,
+                    build_time,
+                    RecordProof::No,
+                    )).map_err(|e| Error::BlockProposingError(format!("{:?}", e)))?;
 
-
-        proposing.map_ok(move |block| {
-            let (header, body) = block.deconstruct();
-            let header_num = *header.number();
-            let header_hash = header.hash();
-            let parent_hash = *header.parent_hash();
-
-            // pub authorities: Vec<(AuthorityId, BabeAuthorityWeight)>,
-            // how to get myself authority_id
-            let authority_id: AuthorityId = ...;
-
-            // sign the pre-sealed hash of the block and then
-            // add it to a digest item.
-            let signature = authority_id.sign(header_hash.as_ref());
-            let signature_digest_item = <DigestItemFor<B> as CompatibleDigestItem>::bftml_seal(signature);
-
-            let block_import_params = BlockImportParams {
-                origin: BlockOrigin::Own,
-                header,
-                justification: None,
-                post_digests: vec![signature_digest_item],
-                body: Some(body),
-                finalized: false,
-                auxiliary: Vec::new(), // block-weight is written in block import.
-                // TODO: block-import handles fork choice and this shouldn't even have the
-                // option to specify one.
-                // https://github.com/paritytech/substrate/issues/3623
-                fork_choice: ForkChoiceStrategy::LongestChain,
-                allow_missing_state: false,
-                import_existing: false,
+		    let (header, body) = proposal.block.deconstruct();
+            
+            // [TODO]: calc seal, how to calculate it in our case?
+            // seal is just a Vec<u8>
+            let seal = b"this_is_a_fake_seal".to_vec();
+            
+            // post seal
+            let (hash, seal) = {
+                let seal = DigestItem::Seal(BFTML_ENGINE_ID, seal);
+                let mut header = header.clone();
+                header.digest_mut().push(seal);
+                let hash = header.hash();
+                let seal = header.digest_mut().pop()
+                    .expect("Pushed one seal above; length greater than zero; qed");
+                (hash, seal)
             };
 
-            info!("Pre-sealed block for proposal at {}. Hash now {:?}, previously {:?}.",
-                  header_num,
-                  block_import_params.post_header().hash(),
-                  header_hash,
-            );
+            let mut import_block = BlockImportParams::new(BlockOrigin::Own, header);
+            import_block.post_digests.push(seal);
+            import_block.body = Some(body);
+            import_block.storage_changes = Some(proposal.storage_changes);
+//            import_block.intermediates.insert(
+//                Cow::from(INTERMEDIATE_KEY),
+//                Box::new(intermediate) as Box<dyn Any>
+//                );
+            import_block.post_hash = Some(hash);
 
-            // immediately import this block
-            if let Err(err) = block_import.lock().import_block(block_import_params, Default::default()) {
-                // warn!(target: "bftml",
-                //	  "Error with block built on {:?}: {:?}",
-                //	  parent_hash,
-                //	  err,
-                // );
-            }
-        })
-        // TODO: need to check, for futures01
-            .map(|_| future::ready(Ok()));
+            block_import.import_block(import_block, HashMap::default())
+                .map_err(|e| Error::BlockBuiltError(best_hash, e))?;
 
-        // Here, we'd better use block mode to finish this block minting.
-        proposing.wait();
+            // [TODO]: send this new Block proposal to upper layer 
+
+        }
     }
 }
 
 
-impl<B, I, E> Future for BftmlWorker<B, I, E> where
+impl<B, C, I, E, SO, S, CAW> Future for BftmlWorker<B, C, I, E, SO, S, CAW> where
     B: BlockT + Clone + Eq,
-    B::Hash: ::std::hash::Hash,
+	C: HeaderBackend<B> + AuxStore + ProvideRuntimeApi<B> + 'static,
     I: BlockImport<B>,
-    E: Environment<B> + Send + Sync
+    E: Environment<B> + Send + Sync,
+	SO: SyncOracle + Send + Sync + 'static,
+	S: SelectChain<B> + 'static,
+	CAW: CanAuthorWith<B> + Send + Sync + 'static,
 {
     // Here, We need to three thing
     // 1. poll the making block directive channel rx to make a new block;
     // 2. on imported a full block, send this new block to new block channel tx;
     // 3. poll the gossip engine consensus message channel rx, send message to gossip network;
     //    and on received a new consensus message from gossip network, send it to another consensus message channel tx;
-    type Item = ();
-    type Error = io::Error;
+    type Output = ();
 
-    fn poll(&mut self) -> Poll<(), Self::Error> {
-        // receive mint block directive
-        match self.mb_rx.poll()? {
-            Async::Ready(Some(msg)) => {
-                if let BftmlChannelMsg::MintBlock(authority_index) = msg {
+    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+        // receive ask proposal directive from upper layer
+        match Stream::poll_next(Pin::new(&mut self.ap_rx), cx) {
+            Poll::Ready(Some(msg)) => {
+                if let BftmlChannelMsg::AskProposal(authority_index) = msg {
                     // mint block
-                    self.mint_block(authority_index);
+                    // TODO: params from self
+                    self.make_proposal(authority_index);
                 }
             },
             _ => {}
         }
 
-        // impoted block
-        match self.imported_block_rx.poll()? {
-            Async::Ready(Some(block)) => {
-                // stuff to do, do we need to wrap this struct BlockImportParams to a new type?
-                // send this block to consensus engine
-                self.ib_tx.unbounded_send(BftmlChannelMsg::ImportBlock(block));
+        // when proposal is ready, give this proposal to upper layer
+        match Stream::poll_next(Pin::new(&mut self.imported_block_rx), cx) {
+            Poll::Ready(Some(bft_proposal)) => {
+                // forward it with gp_tx
+                self.gp_tx.unbounded_send(BftmlChannelMsg::GiveProposal(bft_proposal));
             },
             _ => {}
         }
 
         // gossip communication
         // get msg from gossip network
-        match self.gossip_incoming_end.poll()? {
-            Async::Ready(Some(msg)) => {
-                // here, msg type is TopicNotification
-                let message = msg.message.clone();
+        match Stream::poll_next(Pin::new(&mut self.gossip_incoming_end), cx) {
+            Poll::Ready(Some(gossip_msg_arrived)) => {
+                // message is Vec<u8>
+                let message = gossip_msg_arrived.message.clone();
                 let msg_to_send = BftmlChannelMsg::GossipMsgIncoming(message);
-
-                // send it to consensus engine
+                // forward it with tc_tx
                 self.tc_tx.unbounded_send(msg_to_send);
             },
             _ => {}
         }
 
-        // get msg from consensus engine
-        match self.ts_rx.poll()? {
-            Async::Ready(Some(msg)) => {
+        // get msg from upper layer
+        match Stream::poll_next(Pin::new(&mut self.ts_rx), cx) {
+            Poll::Ready(Some(msg)) => {
                 match msg {
-                    BftmlChannelMsg::GossipMsgOutgoing(message) => {
+                    BftmlChannelMsg::GossipMsgOutgoing(msg) => {
                         // send it to gossip network
                         let topic = make_topic();
+                        // multicast to network
                         self.gossip_engine.gossip_message(topic, message, false);
                     },
                     _ => {}
@@ -318,7 +354,17 @@ impl<B, I, E> Future for BftmlWorker<B, I, E> where
             _ => {}
         }
 
-        Ok(Async::NotReady)
+        // receive ask proposal directive from upper layer
+        match Stream::poll_next(Pin::new(&mut self.cb_rx), cx) {
+            Poll::Ready(Some(msg)) => {
+                if let BftmlChannelMsg::CommitBlock(bft_proposal) = msg {
+                    // TODO: finalize this block
+                }
+            },
+            _ => {}
+        }
+
+        Poll::Pending
     }
 
 }
@@ -326,16 +372,15 @@ impl<B, I, E> Future for BftmlWorker<B, I, E> where
 
 
 pub fn make_topic<B: BlockT>() -> B::Hash {
-    <<B::Header as HeaderT>::Hashing as HashT>::hash(format!("topic-{}", "bftmlgossip").as_bytes())
+    <<B::Header as HeaderT>::Hashing as HashT>::hash(format!("topic-{}", "bftml-gossip").as_bytes())
 }
 
 
 /// Validator is needed by a gossip engine instance
 /// A validator for Bftml gossip messages.
-pub(super) struct GossipValidator<Block: BlockT> {
-}
+pub(super) struct GossipValidator<B: BlockT>;
 
-impl<Block> GossipValidator<Block> {
+impl<B> GossipValidator<B> {
     pub fn new() {
         GossipValidator
     }
@@ -343,8 +388,8 @@ impl<Block> GossipValidator<Block> {
 
 /// Implemention of the network_gossip::Validator
 /// We copy the default implemention from the definition of Validator
-/// And we need only implemente method validate() here.
-impl<Block: BlockT> sc_network_gossip::Validator<Block> for GossipValidator<Block> {
+/// And we need only implement method validate() here.
+impl<B: BlockT> sc_network_gossip::Validator<B> for GossipValidator<B> {
     /// New peer is connected.
     fn new_peer(&self, _context: &mut dyn ValidatorContext<B>, _who: &PeerId, _roles: Roles) {
     }
@@ -356,9 +401,9 @@ impl<Block: BlockT> sc_network_gossip::Validator<Block> for GossipValidator<Bloc
     /// Validate consensus message.
     fn validate(
         &self,
-        context: &mut dyn ValidatorContext<B>,
-        sender: &PeerId,
-        data: &[u8]
+        _context: &mut dyn ValidatorContext<B>,
+        _sender: &PeerId,
+        _data: &[u8]
     ) -> ValidationResult<B::Hash> {
         // now, we should create a topic for message
         // XXX: we'd better to create unique topic for each round
@@ -366,6 +411,7 @@ impl<Block: BlockT> sc_network_gossip::Validator<Block> for GossipValidator<Bloc
         let topic = make_topic();
 
         // And we return ProcessAndKeep variant to test
+	    // Message should be stored and propagated under given topic.
         sc_network_gossip::ValidationResult::ProcessAndKeep(topic)
     }
 
@@ -403,7 +449,7 @@ impl<B: Block> BftmlVerifier<B> {
 
 		let (seal, inner_seal) = match header.digest_mut().pop() {
 			Some(DigestItem::Seal(id, seal)) => {
-				if id == BFTML_ENGINE_ID{
+				if id == BFTML_ENGINE_ID {
 					(DigestItem::Seal(id, seal.clone()), seal)
 				} else {
 					return Err(Error::WrongEngine(id))
@@ -588,13 +634,16 @@ where
 		};
 
         // TODO: verify inner_seal
-
 		if block.fork_choice.is_none() {
 			block.fork_choice = Some(ForkChoiceStrategy::Custom(true));
 		}
 
+        // TODO: convert type BlockImportParams to BftProposal to pass to upper level
+        // let bft_proposal = 
+
+
         // send imported block to upper channel
-        self.imported_block_tx.unbounded_send(block.clone());
+        self.imported_block_tx.unbounded_send(bft_proposal);
 
 		self.inner.import_block(block, new_cache).map_err(Into::into)
     }
@@ -647,17 +696,20 @@ pub fn make_import_queue<B, Transaction>(
 	))
 }
 
+
+
+
 // ===============
 // gen module, including all generating methods about
 // ===============
 pub mod gen {
 
-    pub fn gen_consensus_msg_channels() -> (
+    pub fn gossip_msg_channels() -> (
         UnboundedSender<BftmlChannelMsg>,
         UnboundedReceiver<BftmlChannelMsg>,
         UnboundedSender<BftmlChannelMsg>,
-        UnboundedReceiver<BftmlChannelMsg>
-    ){
+        UnboundedReceiver<BftmlChannelMsg>)
+    {
 
         // Consensus engine to substrate consensus msg channel
         let (ts_tx, ts_rx) = mpsc::unbounded();
@@ -668,29 +720,32 @@ pub mod gen {
         (tc_tx, tc_rx, ts_tx, ts_rx)
     }
 
-    pub fn gen_mint_block_channel() -> (UnboundedSender<BftmlChannelMsg>, UnboundedReceiver<BftmlChannelMsg>) {
-        let (mb_tx, mb_rx) = mpsc::unbounded();
+    pub fn commit_block_channel() -> (UnboundedSender<BftmlChannelMsg>, UnboundedReceiver<BftmlChannelMsg>) {
+        let (cb_tx, cb_rx) = mpsc::unbounded();
 
-        (mb_tx, mb_rx)
+        (cb_tx, cb_rx)
     }
 
-    pub fn gen_import_block_channel() -> (UnboundedSender<BftmlChannelMsg>, UnboundedReceiver<BftmlChannelMsg>) {
-        let (ib_tx, ib_rx) = mpsc::unbounded();
+    pub fn ask_proposal_channel() -> (UnboundedSender<BftmlChannelMsg>, UnboundedReceiver<BftmlChannelMsg>) {
+        let (ap_tx, ap_rx) = mpsc::unbounded();
 
-        (ib_tx, ib_rx)
+        (ap_tx, ap_rx)
     }
 
-    pub fn gen_imported_block_link() -> (UnboundedSender<BlockImportParams>, UnboundedReceiver<BlockImportParams>) {
+    pub fn give_proposal_channel() -> (UnboundedSender<BlockImportParams>, UnboundedReceiver<BlockImportParams>) {
+        let (gp_tx, gp_rx) = mpsc::unbounded();
+
+        (gp_tx, gp_rx)
+    }
+
+    pub fn imported_block_channel() -> (UnboundedSender<BlockImportParams>, UnboundedReceiver<BlockImportParams>) {
         let (imported_block_tx, imported_block_rx) = mpsc::unbounded();
 
         (imported_block_tx, imported_block_rx)
     }
 
-    pub fn<B, S, H> gen_gossip_engine(
-        network: Arc<NetworkService<B, S, H>>,
-        executor: &impl futures03::task::Spawn,)
+    pub fn<B, H> gossip_engine(network: Arc<NetworkService<B, H>>) -> GossipEngine<B> 
         where B: BlockT,
-              S: sc_network::specialization::NetworkSpecialization<B>,
               H: sc_network::ExHashT,
 
     {
@@ -708,12 +763,14 @@ pub mod gen {
         let validator = GossipValidator::new();
         let validator = Arc::new(validator);
 
-        let gossip_engine = GossipEngine::new(network.clone(), executor, BFTML_ENGINE_ID, validator.clone());
+        let gossip_engine = GossipEngine::new(network.clone(), BFTML_ENGINE_ID, "BFTML_GOSSIP", validator.clone());
 
         gossip_engine
     }
 
-    pub fn<B> gen_gossip_incoming_end(&gossip_engine: GossipEngine<B>, topic: B::Hash) -> mpsc::UnboundedReceiver<TopicNotification> {
+    pub fn<B> gen_gossip_incoming_end(&gossip_engine: GossipEngine<B>, topic: B::Hash) -> Receiver<GossipMsgArrived> 
+        where B: BlockT,
+    {
         let gossip_incoming_end = gossip_engine.messages_for(topic);
         gossip_incoming_end
     }
@@ -722,16 +779,16 @@ pub mod gen {
 // ===============
 // Helper Function
 // ===============
-fn get_authorities<A, B, C>(client: &C, at: &BlockId<B>) -> Result<Vec<A>, ConsensusError> where
-    A: Codec,
-    B: BlockT,
-    C: ProvideRuntimeApi + BlockOf + ProvideCache<B>,
-{
-    client
-        .cache()
-        .and_then(|cache| cache
-                  .get_at(&well_known_cache_keys::AUTHORITIES, at)
-                  .and_then(|(_, _, v)| Decode::decode(&mut &v[..]).ok())
-        )
-        .ok_or_else(|| sp_consensus::Error::InvalidAuthoritiesSet.into())
-}
+//fn get_authorities<A, B, C>(client: &C, at: &BlockId<B>) -> Result<Vec<A>, ConsensusError> where
+//    A: Codec,
+//    B: BlockT,
+//    C: ProvideRuntimeApi + BlockOf + ProvideCache<B>,
+//{
+//    client
+//        .cache()
+//        .and_then(|cache| cache
+//                  .get_at(&well_known_cache_keys::AUTHORITIES, at)
+//                  .and_then(|(_, _, v)| Decode::decode(&mut &v[..]).ok())
+//        )
+//        .ok_or_else(|| sp_consensus::Error::InvalidAuthoritiesSet.into())
+//}

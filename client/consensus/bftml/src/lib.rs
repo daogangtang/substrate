@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{self, Instant, Duration};
 use std::pin::Pin;
 use futures::{
@@ -8,9 +7,6 @@ use futures::{
     mpsc::{UnboundedSender, UnboundedReceiver, Sender, Receiver},
 };
 use futures::sync::oneshot;
-use tokio::runtime::TaskExecutor;
-use tokio::timer::Delay;
-use parking_lot::{RwLock, Mutex};
 
 use codec::{Encode, Decode, Codec};
 use sp_core::{Blake2Hasher, H256, Pair};
@@ -66,11 +62,11 @@ enum Error<B: BlockT> {
 	WrongEngine([u8; 4]),
 	#[display(fmt = "Header {:?} is unsealed", _0)]
 	HeaderUnsealed(B::Hash),
-    #[display(fmt = "Multiple BABE pre-runtime digests, rejecting!")]
+    #[display(fmt = "Multiple BFTML pre-runtime digests, rejecting!")]
     MultiplePreRuntimeDigests,
-    #[display(fmt = "No BABE pre-runtime digest found")]
+    #[display(fmt = "No BFTML pre-runtime digest found")]
     NoPreRuntimeDigest,
-    #[display(fmt = "Multiple BABE epoch change digests, rejecting!")]
+    #[display(fmt = "Multiple BFTML epoch change digests, rejecting!")]
     MultipleEpochChangeDigests,
 	#[display(fmt = "Fetching best header failed using select chain: {:?}", _0)]
     BestHeaderSelectChain(ConsensusError), 
@@ -188,7 +184,7 @@ impl<B, C, I, E, SO, S, CAW> BftmlWorker<B, C, I, E, SO, S, CAW> where
 {
     pub fn new(
         client: Arc<C>,
-        block_import: Arc<Mutex<I>>,
+        block_import: Arc<I>,
         proposer_factory: E,
         imported_block_rx: UnboundedReceiver<BftProposal>,
         tc_tx: UnboundedSender<BftmlChannelMsg>,

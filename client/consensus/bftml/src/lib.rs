@@ -41,6 +41,7 @@ use sc_client_api::{
 use sc_keystore::KeyStorePtr;
 use sc_network::NetworkService;
 use sc_network_gossip::{GossipEngine, Validator, ValidatorContext, ValidationResult, TopicNotification};
+use sp_inherents::InherentDataProviders;
 
 mod _app {
     use sp_application_crypto::{
@@ -61,32 +62,60 @@ pub const BFTML_ENGINE_ID: ConsensusEngineId = b"BFTM";
 
 #[derive(derive_more::Display, Debug)]
 enum Error<B: BlockT> {
-        #[display(fmt = "Multiple BABE pre-runtime digests, rejecting!")]
-        MultiplePreRuntimeDigests,
-        #[display(fmt = "No BABE pre-runtime digest found")]
-        NoPreRuntimeDigest,
-        #[display(fmt = "Multiple BABE epoch change digests, rejecting!")]
-        MultipleEpochChangeDigests,
-        #[display(fmt = "Parent ({}) of {} unavailable. Cannot import", _0, _1)]
-        ParentUnavailable(B::Hash, B::Hash),
-        #[display(fmt = "Header {:?} has a bad seal", _0)]
-        HeaderBadSeal(B::Hash),
-        #[display(fmt = "Header {:?} is unsealed", _0)]
-        HeaderUnsealed(B::Hash),
-        #[display(fmt = "Bad signature on {:?}", _0)]
-        BadSignature(B::Hash),
-        #[display(fmt = "Invalid author: Expected secondary author: {:?}, got: {:?}.", _0, _1)]
-        InvalidAuthor(AuthorityId, AuthorityId),
-        #[display(fmt = "Could not fetch parent header: {:?}", _0)]
-        FetchParentHeader(sp_blockchain::Error),
-        #[display(fmt = "Block {} is not valid under any epoch.", _0)]
-        BlockNotValid(B::Hash),
-        #[display(fmt = "Parent block of {} has no associated weight", _0)]
-        ParentBlockNoAssociatedWeight(B::Hash),
-        #[display(fmt = "Checking inherents failed: {}", _0)]
-        CheckInherents(String),
-        Client(sp_blockchain::Error),
-        Runtime(sp_inherents::Error),
+	#[display(fmt = "Header uses the wrong engine {:?}", _0)]
+	WrongEngine([u8; 4]),
+	#[display(fmt = "Header {:?} is unsealed", _0)]
+	HeaderUnsealed(B::Hash),
+    #[display(fmt = "Multiple BABE pre-runtime digests, rejecting!")]
+    MultiplePreRuntimeDigests,
+    #[display(fmt = "No BABE pre-runtime digest found")]
+    NoPreRuntimeDigest,
+    #[display(fmt = "Multiple BABE epoch change digests, rejecting!")]
+    MultipleEpochChangeDigests,
+	#[display(fmt = "Fetching best header failed using select chain: {:?}", _0)]
+    BestHeaderSelectChain(ConsensusError), 
+	#[display(fmt = "Fetching best header failed: {:?}", _0)]
+	BestHeader(sp_blockchain::Error),
+	#[display(fmt = "Best header does not exist")]
+	NoBestHeader,
+	#[display(fmt = "Creating inherents failed: {}", _0)]
+	CreateInherents(sp_inherents::Error),
+    #[display(fmt = "Parent ({}) of {} unavailable. Cannot import", _0, _1)]
+    ParentUnavailable(B::Hash, B::Hash),
+    #[display(fmt = "Header {:?} has a bad seal", _0)]
+    HeaderBadSeal(B::Hash),
+    #[display(fmt = "Header {:?} is unsealed", _0)]
+    HeaderUnsealed(B::Hash),
+    #[display(fmt = "Bad signature on {:?}", _0)]
+    BadSignature(B::Hash),
+    #[display(fmt = "Invalid author: Expected secondary author: {:?}, got: {:?}.", _0, _1)]
+    InvalidAuthor(AuthorityId, AuthorityId),
+    #[display(fmt = "Could not fetch parent header: {:?}", _0)]
+    FetchParentHeader(sp_blockchain::Error),
+    #[display(fmt = "Block {} is not valid under any epoch.", _0)]
+    BlockNotValid(B::Hash),
+    #[display(fmt = "Parent block of {} has no associated weight", _0)]
+    ParentBlockNoAssociatedWeight(B::Hash),
+    #[display(fmt = "Checking inherents failed: {}", _0)]
+    CheckInherents(String),
+	#[display(fmt = "Error with block built on {:?}: {:?}", _0, _1)]
+	BlockBuiltError(B::Hash, ConsensusError),
+    Environment(String),
+    BlockProposingError(String),
+    Client(sp_blockchain::Error),
+    Runtime(sp_inherents::Error),
+}
+
+impl<B: BlockT> std::convert::From<Error<B>> for String {
+	fn from(error: Error<B>) -> String {
+		error.to_string()
+	}
+}
+
+impl<B: BlockT> std::convert::From<Error<B>> for ConsensusError {
+	fn from(error: Error<B>) -> ConsensusError {
+		ConsensusError::ClientImport(error.to_string())
+	}
 }
 
 // struct to send to caller layer
@@ -97,16 +126,12 @@ pub struct BftProposal {
 
 // Bft consensus middle layer channel messages
 pub enum BftmlChannelMsg {
-    // block msg varaints
-    // u32, authority_index
-    MintBlock(u32),
     // gossip msg varaints
     // the inner data is raw opaque u8 vector, parsed by high level consensus engine
     GossipMsgIncoming(Vec<u8>),
     GossipMsgOutgoing(Vec<u8>),
+
     AskProposal(u32),
-    // contains the block passed through
-    ImportBlock(BftProposal),
     GiveProposal(BftProposal),
     // commit this block
     CommitBlock(BftProposal),
@@ -117,7 +142,7 @@ type GossipMsgArrived = TopicNotification;
 //
 // Core bft consensus middle layer worker
 //
-pub struct BftmlWorker<B, C, I, E> {
+pub struct BftmlWorker<B, C, I, E, SO, S, CAW> {
     // hold a ref to substrate client
     client: Arc<C>,
     // hold a ref to substrate block import instance
@@ -144,6 +169,11 @@ pub struct BftmlWorker<B, C, I, E> {
     // generate a proposal tx
     gp_tx: UnboundedSender<BftmlChannelMsg>,
 
+    sync_oracle: SO,
+    select_chain: Option<S>,
+    inherent_data_providers: InherentDataProviders,
+    can_author_with: CAW,
+
 }
 
 
@@ -158,7 +188,6 @@ impl<B, C, I, E, SO, S, CAW> BftmlWorker<B, C, I, E, SO, S, CAW> where
 {
     pub fn new(
         client: Arc<C>,
-        network: SO,  // sync_oracle is also network
         block_import: Arc<Mutex<I>>,
         proposer_factory: E,
         imported_block_rx: UnboundedReceiver<BftProposal>,
@@ -166,10 +195,15 @@ impl<B, C, I, E, SO, S, CAW> BftmlWorker<B, C, I, E, SO, S, CAW> where
         ts_rx: UnboundedReceiver<BftmlChannelMsg>,
         cb_rx: UnboundedReceiver<BftmlChannelMsg>,
         ap_rx: UnboundedReceiver<BftmlChannelMsg>,
-        gp_tx: UnboundedSender<BftmlChannelMsg>
+        gp_tx: UnboundedSender<BftmlChannelMsg>,
+        sync_oracle: SO,  // sync_oracle is also network
+        select_chain: Option<S>,
+        inherent_data_providers: InherentDataProviders,
+        can_author_with: CAW,
     ) {
 
-        let gossip_engine = crate::gen::gen_gossip_engine(network.clone());
+        // sync_oracle is actually a network clone
+        let gossip_engine = crate::gen::gen_gossip_engine(sync_oracle.clone());
         let topic = make_topic();
         let gossip_incoming_end = crate::gen::gen_gossip_incoming_end(&gossip_engine, topic);
 
@@ -185,6 +219,10 @@ impl<B, C, I, E, SO, S, CAW> BftmlWorker<B, C, I, E, SO, S, CAW> where
             cb_rx,
             ap_rx,
             gp_tx,
+            sync_oracle,
+            select_chain,
+            inherent_data_providers,
+            can_author_with,
         }
     }
 
@@ -280,7 +318,8 @@ impl<B, C, I, E, SO, S, CAW> BftmlWorker<B, C, I, E, SO, S, CAW> where
             block_import.import_block(import_block, HashMap::default())
                 .map_err(|e| Error::BlockBuiltError(best_hash, e))?;
 
-            // [TODO]: send this new Block proposal to upper layer 
+            // jump out of loop
+            break;
 
         }
     }
@@ -310,7 +349,13 @@ impl<B, C, I, E, SO, S, CAW> Future for BftmlWorker<B, C, I, E, SO, S, CAW> wher
                 if let BftmlChannelMsg::AskProposal(authority_index) = msg {
                     // mint block
                     // TODO: params from self
-                    self.make_proposal(authority_index);
+                    self.make_proposal(
+                        authority_index, 
+                        &self.client, 
+                        &mut self.sync_oracle,
+                        self.select_chain.as_ref(),
+                        &self.inherent_data_providers,
+                        &self.can_author_with,);
                 }
             },
             _ => {}
@@ -493,7 +538,7 @@ pub struct BftmlBlockImport<B: Block, C, I, S> {
     select_chain: Option<S>,
     inherent_data_providers: sp_inherents::InherentDataProviders,
     check_inherents_after: <<B as Block>::Header as Header>::Number,
-    imported_block_tx: UnboundedSender<BlockImportParams>,
+    imported_block_tx: UnboundedSender<BftProposal>,
 }
 
 impl<B: Block, C, I, S> Clone for BftmlBlockImport<B, C, I, S> {
@@ -523,7 +568,7 @@ where
         select_chain: Option<S>,
         inherent_data_providers: sp_inherents::InherentDataProviders,
         check_inherents_after: <<B as BlockT>::Header as HeaderT>::Number,
-        imported_block_tx: UnboundedSender<BlockImportParams>,
+        imported_block_tx: UnboundedSender<BftProposal>,
     ) -> Self {
         BftmlBlockImport {
             client,
@@ -576,7 +621,7 @@ where
 
 impl<B, C, I, S> BlockImport<B> for BftmlBlockImport<B, C, I, S>
 where
-    B: Block,
+    B: BlockT,
     C: ProvideRuntimeApi<B> + Send + Sync + HeaderBackend<B> + AuxStore + ProvideCache<B> + BlockOf,
     C::Api: BlockBuilderApi<B, Error = sp_blockchain::Error>,
     I: BlockImport<B, Transaction = sp_api::TransactionFor<C, B>> + Send + Sync,
@@ -639,10 +684,9 @@ where
 		}
 
         // TODO: convert type BlockImportParams to BftProposal to pass to upper level
-        // let bft_proposal = 
+        let bft_proposal = BftProposal; 
 
-
-        // send imported block to upper channel
+        // Send imported block to imported_block_rx, which was polled in the BftmlWorker.
         self.imported_block_tx.unbounded_send(bft_proposal);
 
 		self.inner.import_block(block, new_cache).map_err(Into::into)
@@ -653,12 +697,12 @@ where
 /// only use timestamp inherent now
 pub fn register_bftml_inherent_data_provider(
 	inherent_data_providers: &InherentDataProviders,
-) -> Result<(), sp_consensus::Error> {
+) -> Result<(), ConsensusError> {
 	if !inherent_data_providers.has_provider(&sp_timestamp::INHERENT_IDENTIFIER) {
 		inherent_data_providers
 			.register_provider(sp_timestamp::InherentDataProvider)
 			.map_err(Into::into)
-			.map_err(sp_consensus::Error::InherentData)
+			.map_err(ConsensusError::InherentData)
 	} else {
 		Ok(())
 	}
@@ -675,10 +719,7 @@ pub fn make_import_queue<B, Transaction>(
 	inherent_data_providers: InherentDataProviders,
 	spawner: &impl sp_core::traits::SpawnNamed,
 	registry: Option<&Registry>,
-) -> Result<
-	BftmlImportQueue<B, Transaction>,
-	sp_consensus::Error
-> where
+) -> Result<BftmlImportQueue<B, Transaction>, ConsensusError> where
 	B: Block,
 	Transaction: Send + Sync + 'static,
 {
@@ -768,7 +809,7 @@ pub mod gen {
         gossip_engine
     }
 
-    pub fn<B> gen_gossip_incoming_end(&gossip_engine: GossipEngine<B>, topic: B::Hash) -> Receiver<GossipMsgArrived> 
+    pub fn<B> gossip_incoming_end(&gossip_engine: GossipEngine<B>, topic: B::Hash) -> Receiver<GossipMsgArrived> 
         where B: BlockT,
     {
         let gossip_incoming_end = gossip_engine.messages_for(topic);

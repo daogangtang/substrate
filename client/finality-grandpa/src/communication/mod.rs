@@ -69,7 +69,7 @@ mod periodic;
 pub(crate) mod tests;
 
 pub use sp_finality_grandpa::GRANDPA_ENGINE_ID;
-pub const GRANDPA_PROTOCOL_NAME: &[u8] = b"/paritytech/grandpa/1";
+pub const GRANDPA_PROTOCOL_NAME: &'static str = "/paritytech/grandpa/1";
 
 // cost scalars for reporting peers.
 mod cost {
@@ -701,8 +701,8 @@ impl<Block: BlockT> Sink<Message<Block>> for OutgoingMessages<Block>
 				keystore.local_id().clone(),
 				self.round,
 				self.set_id,
-			).ok_or(
-				Error::Signing(format!(
+			).ok_or_else(
+				|| Error::Signing(format!(
 					"Failed to sign GRANDPA vote for round {} targetting {:?}", self.round, target_hash
 				))
 			)?;

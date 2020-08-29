@@ -60,8 +60,22 @@ pub use codec;
 #[doc(hidden)]
 pub use sp_arithmetic;
 
+/// Simple Extension trait to easily convert `None` from index closures to `Err`.
+///
+/// This is only generated and re-exported for the compact solution code to use.
+#[doc(hidden)]
+pub trait __OrInvalidIndex<T> {
+	fn or_invalid_index(self) -> Result<T, Error>;
+}
+
+impl<T> __OrInvalidIndex<T> for Option<T> {
+	fn or_invalid_index(self) -> Result<T, Error> {
+		self.ok_or(Error::CompactInvalidIndex)
+	}
+}
+
 // re-export the compact solution type.
-pub use sp_npos_elections_compact::generate_compact_solution_type;
+pub use sp_npos_elections_compact::generate_solution_type;
 
 /// A trait to limit the number of votes per voter. The generated compact type will implement this.
 pub trait VotingLimit {
@@ -371,6 +385,10 @@ pub fn seq_phragmen<AccountId, R>(
 	voters.extend(initial_voters.into_iter().map(|(who, voter_stake, votes)| {
 		let mut edges: Vec<Edge<AccountId>> = Vec::with_capacity(votes.len());
 		for v in votes {
+			if edges.iter().any(|e| e.who == v) {
+				// duplicate edge.
+				continue;
+			}
 			if let Some(idx) = c_idx_cache.get(&v) {
 				// This candidate is valid + already cached.
 				candidates[*idx].approval_stake = candidates[*idx].approval_stake
@@ -416,7 +434,7 @@ pub fn seq_phragmen<AccountId, R>(
 						n.load.n(),
 						n.budget,
 						c.approval_stake,
-					).unwrap_or(Bounded::max_value());
+					).unwrap_or_else(|_| Bounded::max_value());
 					let temp_d = n.load.d();
 					let temp = Rational128::from(temp_n, temp_d);
 					c.score = c.score.lazy_saturating_add(temp);
@@ -470,14 +488,14 @@ pub fn seq_phragmen<AccountId, R>(
 								n.load.n(),
 							)
 							// If result cannot fit in u128. Not much we can do about it.
-							.unwrap_or(Bounded::max_value());
+							.unwrap_or_else(|_| Bounded::max_value());
 
 							TryFrom::try_from(parts)
 								// If the result cannot fit into R::Inner. Defensive only. This can
 								// never happen. `desired_scale * e / n`, where `e / n < 1` always
 								// yields a value smaller than `desired_scale`, which will fit into
 								// R::Inner.
-								.unwrap_or(Bounded::max_value())
+								.unwrap_or_else(|_| Bounded::max_value())
 						} else {
 							// defensive only. Both edge and voter loads are built from
 							// scores, hence MUST have the same denominator.
@@ -745,7 +763,7 @@ fn do_balancing<AccountId>(
 		e.1 = 0;
 	});
 
-	elected_edges.sort_unstable_by_key(|e|
+	elected_edges.sort_by_key(|e|
 		if let Some(e) = support_map.get(&e.0) { e.total } else { Zero::zero() }
 	);
 

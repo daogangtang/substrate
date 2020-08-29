@@ -95,11 +95,11 @@ decl_event!(
 		<T as frame_system::Trait>::AccountId,
 		<T as Trait>::AccountIndex
 	{
-		/// A account index was assigned.
+		/// A account index was assigned. [who, index]
 		IndexAssigned(AccountId, AccountIndex),
-		/// A account index has been freed up (unassigned).
+		/// A account index has been freed up (unassigned). [index]
 		IndexFreed(AccountIndex),
-		/// A account index has been frozen to its current account ID.
+		/// A account index has been frozen to its current account ID. [who, index]
 		IndexFrozen(AccountIndex, AccountId),
 	}
 );
@@ -121,6 +121,9 @@ decl_error! {
 
 decl_module! {
 	pub struct Module<T: Trait> for enum Call where origin: T::Origin, system = frame_system {
+		/// The deposit needed for reserving an index.
+		const Deposit: BalanceOf<T> = T::Deposit::get();
+
 		fn deposit_event() = default;
 
 		/// Assign an previously unassigned index.

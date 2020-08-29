@@ -897,6 +897,14 @@ pub trait Currency<AccountId> {
 	/// in the case of overflow.
 	fn issue(amount: Self::Balance) -> Self::NegativeImbalance;
 
+	/// Produce a pair of imbalances that cancel each other out exactly.
+	///
+	/// This is just the same as burning and issuing the same amount and has no effect on the
+	/// total issuance.
+	fn pair(amount: Self::Balance) -> (Self::PositiveImbalance, Self::NegativeImbalance) {
+		(Self::burn(amount.clone()), Self::issue(amount))
+	}
+
 	/// The 'free' balance of a given account.
 	///
 	/// This is the only balance that matters in terms of most operations on tokens. It alone
@@ -1230,7 +1238,7 @@ pub trait ChangeMembers<AccountId: Clone + Ord> {
 	///
 	/// This resets any previous value of prime.
 	fn change_members(incoming: &[AccountId], outgoing: &[AccountId], mut new: Vec<AccountId>) {
-		new.sort_unstable();
+		new.sort();
 		Self::change_members_sorted(incoming, outgoing, &new[..]);
 	}
 
@@ -1337,7 +1345,10 @@ pub trait Randomness<Output> {
 	}
 }
 
-impl<Output: Decode + Default> Randomness<Output> for () {
+/// Provides an implementation of [`Randomness`] that should only be used in tests!
+pub struct TestRandomness;
+
+impl<Output: Decode + Default> Randomness<Output> for TestRandomness {
 	fn random(subject: &[u8]) -> Output {
 		Output::decode(&mut TrailingZeroInput::new(subject)).unwrap_or_default()
 	}
@@ -1490,6 +1501,15 @@ pub mod schedule {
 	/// higher priority.
 	pub type Priority = u8;
 
+	/// The dispatch time of a scheduled task.
+	#[derive(Encode, Decode, Copy, Clone, PartialEq, Eq, RuntimeDebug)]
+	pub enum DispatchTime<BlockNumber> {
+		/// At specified block.
+		At(BlockNumber),
+		/// After specified number of blocks.
+		After(BlockNumber),
+	}
+
 	/// The highest priority. We invert the value so that normal sorting will place the highest
 	/// priority at the beginning of the list.
 	pub const HIGHEST_PRIORITY: Priority = 0;
@@ -1510,7 +1530,7 @@ pub mod schedule {
 		///
 		/// Infallible.
 		fn schedule(
-			when: BlockNumber,
+			when: DispatchTime<BlockNumber>,
 			maybe_periodic: Option<Period<BlockNumber>>,
 			priority: Priority,
 			origin: Origin,
@@ -1540,7 +1560,7 @@ pub mod schedule {
 		/// - `id`: The identity of the task. This must be unique and will return an error if not.
 		fn schedule_named(
 			id: Vec<u8>,
-			when: BlockNumber,
+			when: DispatchTime<BlockNumber>,
 			maybe_periodic: Option<Period<BlockNumber>>,
 			priority: Priority,
 			origin: Origin,
@@ -1634,6 +1654,17 @@ impl<T> IsType<T> for T {
 	fn into_ref(&self) -> &T { self }
 	fn from_mut(t: &mut T) -> &mut Self { t }
 	fn into_mut(&mut self) -> &mut T { self }
+}
+
+/// An instance of a pallet in the storage.
+///
+/// It is required that these instances are unique, to support multiple instances per pallet in the same runtime!
+///
+/// E.g. for module MyModule default instance will have prefix "MyModule" and other instances
+/// "InstanceNMyModule".
+pub trait Instance: 'static {
+    /// Unique module prefix. E.g. "InstanceNMyModule" or "MyModule"
+    const PREFIX: &'static str ;
 }
 
 #[cfg(test)]

@@ -20,7 +20,6 @@
 #![cfg(test)]
 
 use super::*;
-use codec::Decode;
 use sp_std::prelude::*;
 use sp_runtime::{traits::{BlakeTwo256, IdentityLookup}, testing::{H256, Header}};
 use frame_support::{
@@ -64,12 +63,10 @@ pub trait OtherTrait {
 	type OtherEvent;
 }
 
-pub trait Trait: OtherTrait where Self::OtherEvent: Into<Self::Event> {
+pub trait Trait: frame_system::Trait + OtherTrait
+	where Self::OtherEvent: Into<<Self as Trait>::Event>
+{
 	type Event;
-	type BlockNumber;
-	type AccountId: 'static + Default + Decode;
-	type Origin: From<frame_system::RawOrigin<Self::AccountId>> +
-		Into<Result<RawOrigin<Self::AccountId>, Self::Origin>>;
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -105,9 +102,6 @@ impl frame_system::Trait for Test {
 
 impl Trait for Test {
 	type Event = ();
-	type BlockNumber = u32;
-	type Origin = Origin;
-	type AccountId = u64;
 }
 
 impl OtherTrait for Test {
@@ -165,6 +159,10 @@ benchmarks!{
 	verify {
 		ensure!(m[0] == 0, "You forgot to sort!")
 	}
+
+	no_components {
+		let caller = account::<T::AccountId>("caller", 0, 0);
+	}: set_value(RawOrigin::Signed(caller), 0)
 }
 
 #[test]
@@ -178,10 +176,11 @@ fn benchmarks_macro_works() {
 	let closure = <SelectedBenchmark as BenchmarkingSetup<Test>>::instance(
 		&selected,
 		&[(BenchmarkParameter::b, 1)],
+		true,
 	).expect("failed to create closure");
 
 	new_test_ext().execute_with(|| {
-		assert_eq!(closure(), Ok(()));
+		assert_ok!(closure());
 	});
 }
 
@@ -195,6 +194,7 @@ fn benchmarks_macro_rename_works() {
 	let closure = <SelectedBenchmark as BenchmarkingSetup<Test>>::instance(
 		&selected,
 		&[(BenchmarkParameter::b, 1)],
+		true,
 	).expect("failed to create closure");
 
 	new_test_ext().execute_with(|| {
@@ -212,9 +212,10 @@ fn benchmarks_macro_works_for_non_dispatchable() {
 	let closure = <SelectedBenchmark as BenchmarkingSetup<Test>>::instance(
 		&selected,
 		&[(BenchmarkParameter::x, 1)],
+		true,
 	).expect("failed to create closure");
 
-	assert_eq!(closure(), Ok(()));
+	assert_ok!(closure());
 }
 
 #[test]
@@ -222,13 +223,27 @@ fn benchmarks_macro_verify_works() {
 	// Check postcondition for benchmark `set_value` is valid.
 	let selected = SelectedBenchmark::set_value;
 
-	let closure = <SelectedBenchmark as BenchmarkingSetup<Test>>::verify(
+	let closure = <SelectedBenchmark as BenchmarkingSetup<Test>>::instance(
 		&selected,
 		&[(BenchmarkParameter::b, 1)],
+		true,
 	).expect("failed to create closure");
 
 	new_test_ext().execute_with(|| {
 		assert_ok!(closure());
+	});
+
+	// Check postcondition for benchmark `bad_verify` is invalid.
+	let selected = SelectedBenchmark::bad_verify;
+
+	let closure = <SelectedBenchmark as BenchmarkingSetup<Test>>::instance(
+		&selected,
+		&[(BenchmarkParameter::x, 10000)],
+		true,
+	).expect("failed to create closure");
+
+	new_test_ext().execute_with(|| {
+		assert_err!(closure(), "You forgot to sort!");
 	});
 }
 
@@ -240,5 +255,6 @@ fn benchmarks_generate_unit_tests() {
 		assert_ok!(test_benchmark_sort_vector::<Test>());
 		assert_err!(test_benchmark_bad_origin::<Test>(), "Bad origin");
 		assert_err!(test_benchmark_bad_verify::<Test>(), "You forgot to sort!");
+		assert_ok!(test_benchmark_no_components::<Test>());
 	});
 }

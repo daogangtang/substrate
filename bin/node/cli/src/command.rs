@@ -20,6 +20,8 @@ use crate::{chain_spec, service, Cli, Subcommand};
 use node_executor::Executor;
 use node_runtime::{Block, RuntimeApi};
 use sc_cli::{Result, SubstrateCli, RuntimeVersion, Role, ChainSpec};
+use sc_service::PartialComponents;
+use crate::service::new_partial;
 
 impl SubstrateCli for Cli {
 	fn impl_name() -> String {
@@ -91,11 +93,16 @@ pub fn run() -> Result<()> {
 				Ok(())
 			}
 		}
+		Some(Subcommand::Key(cmd)) => cmd.run(),
+		Some(Subcommand::Sign(cmd)) => cmd.run(),
+		Some(Subcommand::Verify(cmd)) => cmd.run(),
+		Some(Subcommand::Vanity(cmd)) => cmd.run(),
 		Some(Subcommand::Base(subcommand)) => {
 			let runner = cli.create_runner(subcommand)?;
 			runner.run_subcommand(subcommand, |config| {
-				let (builder, _, _, _) = new_full_start!(config);
-				Ok(builder.to_chain_ops_parts())
+				let PartialComponents { client, backend, task_manager, import_queue, ..}
+					= new_partial(&config)?;
+				Ok((client, backend, import_queue, task_manager))
 			})
 		}
 	}

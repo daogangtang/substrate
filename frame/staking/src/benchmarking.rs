@@ -23,7 +23,7 @@ use testing_utils::*;
 
 use sp_runtime::traits::One;
 use frame_system::RawOrigin;
-pub use frame_benchmarking::{benchmarks, account};
+pub use frame_benchmarking::{benchmarks, account, whitelisted_caller};
 const SEED: u32 = 0;
 const MAX_SPANS: u32 = 100;
 const MAX_VALIDATORS: u32 = 1000;
@@ -55,13 +55,11 @@ pub fn create_validator_with_nominators<T: Trait>(
 	let mut points_total = 0;
 	let mut points_individual = Vec::new();
 
-	MinimumValidatorCount::put(0);
-
 	let (v_stash, v_controller) = create_stash_controller::<T>(0, 100)?;
 	let validator_prefs = ValidatorPrefs {
 		commission: Perbill::from_percent(50),
 	};
-	Staking::<T>::validate(RawOrigin::Signed(v_controller.clone()).into(), validator_prefs)?;
+	Staking::<T>::validate(RawOrigin::Signed(v_controller).into(), validator_prefs)?;
 	let stash_lookup: <T::Lookup as StaticLookup>::Source = T::Lookup::unlookup(v_stash.clone());
 
 	points_total += 10;
@@ -282,7 +280,7 @@ benchmarks! {
 		let validator = create_validator_with_nominators::<T>(n, T::MaxNominatorRewardedPerValidator::get() as u32, true)?;
 
 		let current_era = CurrentEra::get().unwrap();
-		let caller = account("caller", 0, SEED);
+		let caller = whitelisted_caller();
 		let balance_before = T::Currency::free_balance(&validator);
 	}: _(RawOrigin::Signed(caller), validator.clone(), current_era)
 	verify {
@@ -296,7 +294,7 @@ benchmarks! {
 		let validator = create_validator_with_nominators::<T>(n, T::MaxNominatorRewardedPerValidator::get() as u32, false)?;
 
 		let current_era = CurrentEra::get().unwrap();
-		let caller = account("caller", 0, SEED);
+		let caller = whitelisted_caller();
 		let balance_before = T::Currency::free_balance(&validator);
 	}: payout_stakers(RawOrigin::Signed(caller), validator.clone(), current_era)
 	verify {
@@ -356,7 +354,7 @@ benchmarks! {
 	new_era {
 		let v in 1 .. 10;
 		let n in 1 .. 100;
-		MinimumValidatorCount::put(0);
+
 		create_validators_with_nominators_for_era::<T>(v, n, MAX_NOMINATIONS, false, None)?;
 		let session_index = SessionIndex::one();
 	}: {
@@ -375,7 +373,7 @@ benchmarks! {
 		for _ in 0 .. l {
 			staking_ledger.unlocking.push(unlock_chunk.clone())
 		}
-		Ledger::<T>::insert(controller.clone(), staking_ledger.clone());
+		Ledger::<T>::insert(controller, staking_ledger);
 		let slash_amount = T::Currency::minimum_balance() * 10.into();
 		let balance_before = T::Currency::free_balance(&stash);
 	}: {
@@ -393,7 +391,6 @@ benchmarks! {
 	payout_all {
 		let v in 1 .. 10;
 		let n in 1 .. 100;
-		MinimumValidatorCount::put(0);
 		create_validators_with_nominators_for_era::<T>(v, n, MAX_NOMINATIONS, false, None)?;
 		// Start a new Era
 		let new_validators = Staking::<T>::new_era(SessionIndex::one()).unwrap();
@@ -422,7 +419,7 @@ benchmarks! {
 		let total_payout = T::Currency::minimum_balance() * 1000.into();
 		<ErasValidatorReward<T>>::insert(current_era, total_payout);
 
-		let caller: T::AccountId = account("caller", 0, SEED);
+		let caller: T::AccountId = whitelisted_caller();
 	}: {
 		for arg in payout_calls_arg {
 			<Staking<T>>::payout_stakers(RawOrigin::Signed(caller.clone()).into(), arg.0, arg.1)?;
@@ -474,6 +471,10 @@ benchmarks! {
 
 		let era = <Staking<T>>::current_era().unwrap_or(0);
 		let caller: T::AccountId = account("caller", n, SEED);
+
+		// Whitelist caller account from further DB operations.
+		let caller_key = frame_system::Account::<T>::hashed_key_for(&caller);
+		frame_benchmarking::benchmarking::add_to_whitelist(caller_key.into());
 	}: {
 		let result = <Staking<T>>::submit_election_solution(
 			RawOrigin::Signed(caller.clone()).into(),
@@ -535,6 +536,10 @@ benchmarks! {
 		let era = <Staking<T>>::current_era().unwrap_or(0);
 		let caller: T::AccountId = account("caller", n, SEED);
 
+		// Whitelist caller account from further DB operations.
+		let caller_key = frame_system::Account::<T>::hashed_key_for(&caller);
+		frame_benchmarking::benchmarking::add_to_whitelist(caller_key.into());
+
 		// submit a very bad solution on-chain
 		{
 			// this is needed to fool the chain to accept this solution.
@@ -577,7 +582,6 @@ benchmarks! {
 		// number of nominator intent
 		let n in 1000 .. 2000;
 
-		MinimumValidatorCount::put(0);
 		create_validators_with_nominators_for_era::<T>(v, n, MAX_NOMINATIONS, false, None)?;
 
 		// needed for the solution to be generates.
@@ -587,6 +591,10 @@ benchmarks! {
 		<EraElectionStatus<T>>::put(ElectionStatus::Open(T::BlockNumber::from(1u32)));
 		let caller: T::AccountId = account("caller", n, SEED);
 		let era = <Staking<T>>::current_era().unwrap_or(0);
+
+		// Whitelist caller account from further DB operations.
+		let caller_key = frame_system::Account::<T>::hashed_key_for(&caller);
+		frame_benchmarking::benchmarking::add_to_whitelist(caller_key.into());
 
 		// submit a seq-phragmen with all the good stuff on chain.
 		{
@@ -707,7 +715,8 @@ mod tests {
 			let closure_to_benchmark =
 				<SelectedBenchmark as frame_benchmarking::BenchmarkingSetup<Test>>::instance(
 					&selected_benchmark,
-					&c
+					&c,
+					true
 				).unwrap();
 
 			assert_ok!(closure_to_benchmark());

@@ -27,7 +27,7 @@ use wasm_bindgen::prelude::*;
 use futures::{
 	prelude::*, channel::{oneshot, mpsc}, compat::*, future::{ready, ok, select}
 };
-use std::{sync::Arc, pin::Pin};
+use std::pin::Pin;
 use sc_chain_spec::Extension;
 use libp2p_wasm_ext::{ExtTransport, ffi};
 
@@ -64,7 +64,10 @@ where
 		network,
 		telemetry_endpoints: chain_spec.telemetry_endpoints().clone(),
 		chain_spec: Box::new(chain_spec),
-		task_executor: (|fut, _| wasm_bindgen_futures::spawn_local(fut)).into(),
+		task_executor: (|fut, _| {
+			wasm_bindgen_futures::spawn_local(fut);
+			async {}
+		}).into(),
 		telemetry_external_transport: Some(transport),
 		role: Role::Light,
 		database: {
@@ -121,7 +124,7 @@ struct RpcMessage {
 }
 
 /// Create a Client object that connects to a service.
-pub fn start_client(mut task_manager: TaskManager, rpc_handlers: Arc<RpcHandlers>) -> Client {
+pub fn start_client(mut task_manager: TaskManager, rpc_handlers: RpcHandlers) -> Client {
 	// We dispatch a background task responsible for processing the service.
 	//
 	// The main action performed by the code below consists in polling the service with

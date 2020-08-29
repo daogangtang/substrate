@@ -179,7 +179,7 @@ pub struct BftmlWorker<B: BlockT, C: ProvideRuntimeApi<B>, E, SO, S, CAW, H: ExH
 }
 
 
-impl<B, C, E, SO: std::clone::Clone, S, CAW, H> BftmlWorker<B, C, E, SO, S, CAW, H> where
+impl<B, C, E, SO, S, CAW, H> BftmlWorker<B, C, E, SO, S, CAW, H> where
     B: BlockT + Clone + Eq,
 	C: HeaderBackend<B> + AuxStore + ProvideRuntimeApi<B> + 'static,
     //I: BlockImport<B>,
@@ -335,9 +335,9 @@ impl<B, C, E, SO, S, CAW, H> Future for BftmlWorker<B, C, E, SO, S, CAW, H> wher
     E::Proposer: Proposer<B, Transaction = sp_api::TransactionFor<C, B>>,
     E::Error: std::fmt::Debug,
     sp_api::TransactionFor<C, B>: 'static,
-	SO: SyncOracle + Clone + Send + Sync + 'static + std::marker::Unpin,
+	SO: SyncOracle + Send + Sync + 'static + std::marker::Unpin,
 	S: SelectChain<B> + 'static + std::marker::Unpin,
-	CAW: CanAuthorWith<B> + Clone + Send + Sync + 'static + std::marker::Unpin,
+	CAW: CanAuthorWith<B> + Send + Sync + 'static + std::marker::Unpin,
     H: ExHashT,
 {
     // Here, We need to three thing

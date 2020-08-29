@@ -176,7 +176,6 @@ pub struct BftmlWorker<B: BlockT, C: ProvideRuntimeApi<B>, E, SO, S, CAW, H: ExH
     select_chain: Option<S>,
     inherent_data_providers: InherentDataProviders,
     can_author_with: CAW,
-
 }
 
 
@@ -189,7 +188,7 @@ impl<B, C, E, SO: std::clone::Clone, S, CAW, H> BftmlWorker<B, C, E, SO, S, CAW,
     E::Error: std::fmt::Debug,
     sp_api::TransactionFor<C, B>: 'static,
 	SO: SyncOracle + Send + Sync + 'static,
-	S: SelectChain<B> + 'static,
+	S: SelectChain<B> + Send + Sync + 'static,
 	CAW: CanAuthorWith<B> + Send + Sync + 'static,
     H: ExHashT,
 {
@@ -211,9 +210,9 @@ impl<B, C, E, SO: std::clone::Clone, S, CAW, H> BftmlWorker<B, C, E, SO, S, CAW,
     ) -> BftmlWorker<B, C, E, SO, S, CAW, H> {
 
         // sync_oracle is actually a network clone
-        let gossip_engine = crate::gen::gossip_engine(network.clone());
+        let mut gossip_engine = crate::gen::gossip_engine(network.clone());
         let topic = make_topic::<B>();
-        let gossip_incoming_end = crate::gen::gossip_incoming_end(&gossip_engine, topic);
+        let gossip_incoming_end = crate::gen::gossip_incoming_end(&mut gossip_engine, topic);
 
         BftmlWorker {
             client,
@@ -235,23 +234,16 @@ impl<B, C, E, SO: std::clone::Clone, S, CAW, H> BftmlWorker<B, C, E, SO, S, CAW,
         }
     }
 
-    fn make_proposal(
-        &mut self, 
-        authority_index: u32, 
-	    client: &C,
-        sync_oracle: &mut SO, 
-        select_chain: Option<&S>,
-        inherent_data_providers: &sp_inherents::InherentDataProviders,
-        can_author_with: &CAW,) -> Result<(), Error<B>> {
+    fn make_proposal(&mut self, authority_index: u32) -> Result<(), Error<B>> {
 
         'outer: loop {
-            if sync_oracle.is_major_syncing() {
+            if self.sync_oracle.is_major_syncing() {
                 debug!(target: "bftml", "Skipping proposal due to sync.");
                 std::thread::sleep(std::time::Duration::new(1, 0));
                 continue 'outer
             }
 
-            let (best_hash, best_header) = match select_chain {
+            let (best_hash, best_header) = match &self.select_chain {
                 Some(select_chain) => {
                     let header = select_chain.best_chain()
                         .map_err(Error::BestHeaderSelectChain)?;
@@ -259,15 +251,15 @@ impl<B, C, E, SO: std::clone::Clone, S, CAW, H> BftmlWorker<B, C, E, SO, S, CAW,
                     (hash, header)
                 },
                 None => {
-                    let hash = client.info().best_hash;
-                    let header = client.header(BlockId::Hash(hash))
+                    let hash = self.client.info().best_hash;
+                    let header = self.client.header(BlockId::Hash(hash))
                         .map_err(Error::BestHeader)?
                         .ok_or(Error::NoBestHeader)?;
                     (hash, header)
                 },
             };
 		
-            if let Err(err) = can_author_with.can_author_with(&BlockId::Hash(best_hash)) {
+            if let Err(err) = self.can_author_with.can_author_with(&BlockId::Hash(best_hash)) {
                 warn!(
                     target: "bftml",
                     "Skipping proposal `can_author_with` returned: {} \
@@ -282,7 +274,7 @@ impl<B, C, E, SO: std::clone::Clone, S, CAW, H> BftmlWorker<B, C, E, SO, S, CAW,
             let proposer = futures::executor::block_on(self.proposer_factory.init(&best_header))
                 .map_err(|e| Error::Environment(format!("{:?}", e)))?;
 
-            let inherent_data = inherent_data_providers
+            let inherent_data = self.inherent_data_providers
                 .create_inherent_data().map_err(Error::CreateInherents)?;
             let mut inherent_digest = Digest::default();
 //            if let Some(preruntime) = &preruntime {
@@ -339,13 +331,13 @@ impl<B, C, E, SO, S, CAW, H> Future for BftmlWorker<B, C, E, SO, S, CAW, H> wher
     B: BlockT + Clone + Eq,
 	C: HeaderBackend<B> + AuxStore + ProvideRuntimeApi<B> + 'static,
     //I: BlockImport<B>,
-    E: Environment<B> + Send + Sync,
+    E: Environment<B> + Send + Sync + std::marker::Unpin,
     E::Proposer: Proposer<B, Transaction = sp_api::TransactionFor<C, B>>,
     E::Error: std::fmt::Debug,
     sp_api::TransactionFor<C, B>: 'static,
-	SO: SyncOracle + Clone + Send + Sync + 'static,
-	S: SelectChain<B> + 'static,
-	CAW: CanAuthorWith<B> + Send + Sync + 'static,
+	SO: SyncOracle + Clone + Send + Sync + 'static + std::marker::Unpin,
+	S: SelectChain<B> + 'static + std::marker::Unpin,
+	CAW: CanAuthorWith<B> + Clone + Send + Sync + 'static + std::marker::Unpin,
     H: ExHashT,
 {
     // Here, We need to three thing
@@ -355,56 +347,51 @@ impl<B, C, E, SO, S, CAW, H> Future for BftmlWorker<B, C, E, SO, S, CAW, H> wher
     //    and on received a new consensus message from gossip network, send it to another consensus message channel tx;
     type Output = ();
 
-    fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context) -> Poll<Self::Output> {
         // receive ask proposal directive from upper layer
-        match Stream::poll_next(Pin::new(&mut self.ap_rx), cx) {
+        let worker = self.get_mut();
+        match Stream::poll_next(Pin::new(&mut worker.ap_rx), cx) {
             Poll::Ready(Some(msg)) => {
                 if let BftmlChannelMsg::AskProposal(authority_index) = msg {
                     // mint block
                     // TODO: params from self
-                    self.make_proposal(
-                        authority_index, 
-                        &self.client, 
-                        &mut self.sync_oracle,
-                        self.select_chain.as_ref(),
-                        &self.inherent_data_providers,
-                        &self.can_author_with,);
+                    worker.make_proposal(authority_index);
                 }
             },
             _ => {}
         }
 
         // when proposal is ready, give this proposal to upper layer
-        match Stream::poll_next(Pin::new(&mut self.imported_block_rx), cx) {
+        match Stream::poll_next(Pin::new(&mut worker.imported_block_rx), cx) {
             Poll::Ready(Some(bft_proposal)) => {
                 // forward it with gp_tx
-                self.gp_tx.unbounded_send(BftmlChannelMsg::GiveProposal(bft_proposal));
+                worker.gp_tx.unbounded_send(BftmlChannelMsg::GiveProposal(bft_proposal));
             },
             _ => {}
         }
 
         // gossip communication
         // get msg from gossip network
-        match Stream::poll_next(Pin::new(&mut self.gossip_incoming_end), cx) {
+        match Stream::poll_next(Pin::new(&mut worker.gossip_incoming_end), cx) {
             Poll::Ready(Some(gossip_msg_arrived)) => {
                 // message is Vec<u8>
                 let message = gossip_msg_arrived.message.clone();
                 let msg_to_send = BftmlChannelMsg::GossipMsgIncoming(message);
                 // forward it with tc_tx
-                self.tc_tx.unbounded_send(msg_to_send);
+                worker.tc_tx.unbounded_send(msg_to_send);
             },
             _ => {}
         }
 
         // get msg from upper layer
-        match Stream::poll_next(Pin::new(&mut self.ts_rx), cx) {
+        match Stream::poll_next(Pin::new(&mut worker.ts_rx), cx) {
             Poll::Ready(Some(msg)) => {
                 match msg {
                     BftmlChannelMsg::GossipMsgOutgoing(msg) => {
                         // send it to gossip network
                         let topic = make_topic::<B>();
                         // multicast to network
-                        self.gossip_engine.gossip_message(topic, msg, false);
+                        worker.gossip_engine.gossip_message(topic, msg, false);
                     },
                     _ => {}
                 }
@@ -413,7 +400,7 @@ impl<B, C, E, SO, S, CAW, H> Future for BftmlWorker<B, C, E, SO, S, CAW, H> wher
         }
 
         // receive ask proposal directive from upper layer
-        match Stream::poll_next(Pin::new(&mut self.cb_rx), cx) {
+        match Stream::poll_next(Pin::new(&mut worker.cb_rx), cx) {
             Poll::Ready(Some(msg)) => {
                 if let BftmlChannelMsg::CommitBlock(bft_proposal) = msg {
                     // TODO: finalize this block
@@ -832,7 +819,7 @@ pub mod gen {
         gossip_engine
     }
 
-    pub fn gossip_incoming_end<B>(gossip_engine: &GossipEngine<B>, topic: B::Hash) -> Receiver<GossipMsgArrived> 
+    pub fn gossip_incoming_end<B>(gossip_engine: &mut GossipEngine<B>, topic: B::Hash) -> Receiver<GossipMsgArrived> 
         where B: BlockT,
     {
         let gossip_incoming_end = gossip_engine.messages_for(topic);

@@ -1,12 +1,14 @@
 use std::sync::Arc;
+use std::collections::HashMap;
 use std::time::{self, Instant, Duration};
 use std::pin::Pin;
+use std::marker::PhantomData;
 use futures::{
     Future, Stream,
-    task::{Context, Poll}
-    mpsc::{UnboundedSender, UnboundedReceiver, Sender, Receiver},
+    task::{Context, Poll},
+    channel::mpsc::{self, UnboundedSender, UnboundedReceiver, Sender, Receiver},
 };
-use futures::sync::oneshot;
+use log::*;
 
 use codec::{Encode, Decode, Codec};
 use sp_core::{Blake2Hasher, H256, Pair};
@@ -19,7 +21,7 @@ use sp_consensus::{
     self, BlockImport, Environment, Proposer, BlockCheckParams, ForkChoiceStrategy,
     BlockImportParams, BlockOrigin, ImportResult, Error as ConsensusError,
     SelectChain, SyncOracle, CanAuthorWith, RecordProof,
-    import_queue::{Verifier, BasicQueue, CacheKeyId},
+    import_queue::{Verifier, BasicQueue, BoxBlockImport, BoxJustificationImport, BoxFinalityProofImport,},
 };
 use sp_block_builder::BlockBuilder as BlockBuilderApi;
 use sp_blockchain::{
@@ -30,14 +32,16 @@ use sp_blockchain::{
 use sp_api::{ApiExt, ProvideRuntimeApi};
 use sp_timestamp::{InherentError, TimestampInherentData};
 use sc_client_api::{
+    BlockOf,
     backend::{AuxStore, Backend},
     call_executor::CallExecutor,
     BlockchainEvents, ProvideUncles,
 };
 use sc_keystore::KeyStorePtr;
-use sc_network::NetworkService;
-use sc_network_gossip::{GossipEngine, Validator, ValidatorContext, ValidationResult, TopicNotification};
-use sp_inherents::InherentDataProviders;
+use sc_network::{NetworkService, ObservedRole, PeerId, ExHashT};
+use sc_network_gossip::{GossipEngine, Validator, ValidatorContext, ValidationResult, TopicNotification, MessageIntent};
+use sp_inherents::{InherentDataProviders, InherentData}; 
+use prometheus_endpoint::Registry;
 
 mod _app {
     use sp_application_crypto::{
@@ -52,7 +56,7 @@ pub type AuthorityPair = _app::Pair;
 pub type AuthoritySignature = _app::Signature;
 pub type AuthorityId = _app::Public;
 // ConsensusEngineId type is: [u8; 4];
-pub const BFTML_ENGINE_ID: ConsensusEngineId = b"BFTM";
+pub const BFTML_ENGINE_ID: ConsensusEngineId = *b"BFTM";
 
 
 
@@ -60,8 +64,6 @@ pub const BFTML_ENGINE_ID: ConsensusEngineId = b"BFTM";
 enum Error<B: BlockT> {
 	#[display(fmt = "Header uses the wrong engine {:?}", _0)]
 	WrongEngine([u8; 4]),
-	#[display(fmt = "Header {:?} is unsealed", _0)]
-	HeaderUnsealed(B::Hash),
     #[display(fmt = "Multiple BFTML pre-runtime digests, rejecting!")]
     MultiplePreRuntimeDigests,
     #[display(fmt = "No BFTML pre-runtime digest found")]
@@ -99,7 +101,10 @@ enum Error<B: BlockT> {
     Environment(String),
     BlockProposingError(String),
     Client(sp_blockchain::Error),
-    Runtime(sp_inherents::Error),
+    Runtime,
+    #[display(fmt = "Rejecting block too far in future")]
+    TooFarInFuture,
+
 }
 
 impl<B: BlockT> std::convert::From<Error<B>> for String {
@@ -138,13 +143,15 @@ type GossipMsgArrived = TopicNotification;
 //
 // Core bft consensus middle layer worker
 //
-pub struct BftmlWorker<B, C, I, E, SO, S, CAW> {
+pub struct BftmlWorker<B: BlockT, C: ProvideRuntimeApi<B>, E, SO, S, CAW, H: ExHashT> {
     // hold a ref to substrate client
     client: Arc<C>,
     // hold a ref to substrate block import instance
-    block_import: Arc<I>,
+    //block_import: Arc<I>,
+    block_import: BoxBlockImport<B, sp_api::TransactionFor<C, B>>,
     // proposer for new block
     proposer_factory: E,
+    network: Arc<NetworkService<B, H>>,
 
     // instance of the gossip network engine
     gossip_engine: GossipEngine<B>,
@@ -161,7 +168,7 @@ pub struct BftmlWorker<B, C, I, E, SO, S, CAW> {
     // commit block channel rx
     cb_rx: UnboundedReceiver<BftmlChannelMsg>,
     // ask a proposal rx
-    ap_rx: UnboundedSender<BftmlChannelMsg>,
+    ap_rx: UnboundedReceiver<BftmlChannelMsg>,
     // generate a proposal tx
     gp_tx: UnboundedSender<BftmlChannelMsg>,
 
@@ -173,19 +180,24 @@ pub struct BftmlWorker<B, C, I, E, SO, S, CAW> {
 }
 
 
-impl<B, C, I, E, SO, S, CAW> BftmlWorker<B, C, I, E, SO, S, CAW> where
+impl<B, C, E, SO: std::clone::Clone, S, CAW, H> BftmlWorker<B, C, E, SO, S, CAW, H> where
     B: BlockT + Clone + Eq,
 	C: HeaderBackend<B> + AuxStore + ProvideRuntimeApi<B> + 'static,
-    I: BlockImport<B>,
+    //I: BlockImport<B>,
     E: Environment<B> + Send + Sync,
+    E::Proposer: Proposer<B, Transaction = sp_api::TransactionFor<C, B>>,
+    E::Error: std::fmt::Debug,
+    sp_api::TransactionFor<C, B>: 'static,
 	SO: SyncOracle + Send + Sync + 'static,
 	S: SelectChain<B> + 'static,
 	CAW: CanAuthorWith<B> + Send + Sync + 'static,
+    H: ExHashT,
 {
     pub fn new(
         client: Arc<C>,
-        block_import: Arc<I>,
+        block_import: BoxBlockImport<B, sp_api::TransactionFor<C, B>>,
         proposer_factory: E,
+        network: Arc<NetworkService<B, H>>,
         imported_block_rx: UnboundedReceiver<BftProposal>,
         tc_tx: UnboundedSender<BftmlChannelMsg>,
         ts_rx: UnboundedReceiver<BftmlChannelMsg>,
@@ -196,17 +208,18 @@ impl<B, C, I, E, SO, S, CAW> BftmlWorker<B, C, I, E, SO, S, CAW> where
         select_chain: Option<S>,
         inherent_data_providers: InherentDataProviders,
         can_author_with: CAW,
-    ) {
+    ) -> BftmlWorker<B, C, E, SO, S, CAW, H> {
 
         // sync_oracle is actually a network clone
-        let gossip_engine = crate::gen::gen_gossip_engine(sync_oracle.clone());
-        let topic = make_topic();
-        let gossip_incoming_end = crate::gen::gen_gossip_incoming_end(&gossip_engine, topic);
+        let gossip_engine = crate::gen::gossip_engine(network.clone());
+        let topic = make_topic::<B>();
+        let gossip_incoming_end = crate::gen::gossip_incoming_end(&gossip_engine, topic);
 
         BftmlWorker {
             client,
             block_import,
             proposer_factory,
+            network,
             gossip_engine,
             gossip_incoming_end,
             imported_block_rx,
@@ -311,25 +324,29 @@ impl<B, C, I, E, SO, S, CAW> BftmlWorker<B, C, I, E, SO, S, CAW> where
 //                );
             import_block.post_hash = Some(hash);
 
-            block_import.import_block(import_block, HashMap::default())
+            self.block_import.import_block(import_block, HashMap::default())
                 .map_err(|e| Error::BlockBuiltError(best_hash, e))?;
 
             // jump out of loop
-            break;
+            break Ok(());
 
         }
     }
 }
 
 
-impl<B, C, I, E, SO, S, CAW> Future for BftmlWorker<B, C, I, E, SO, S, CAW> where
+impl<B, C, E, SO, S, CAW, H> Future for BftmlWorker<B, C, E, SO, S, CAW, H> where
     B: BlockT + Clone + Eq,
 	C: HeaderBackend<B> + AuxStore + ProvideRuntimeApi<B> + 'static,
-    I: BlockImport<B>,
+    //I: BlockImport<B>,
     E: Environment<B> + Send + Sync,
-	SO: SyncOracle + Send + Sync + 'static,
+    E::Proposer: Proposer<B, Transaction = sp_api::TransactionFor<C, B>>,
+    E::Error: std::fmt::Debug,
+    sp_api::TransactionFor<C, B>: 'static,
+	SO: SyncOracle + Clone + Send + Sync + 'static,
 	S: SelectChain<B> + 'static,
 	CAW: CanAuthorWith<B> + Send + Sync + 'static,
+    H: ExHashT,
 {
     // Here, We need to three thing
     // 1. poll the making block directive channel rx to make a new block;
@@ -385,9 +402,9 @@ impl<B, C, I, E, SO, S, CAW> Future for BftmlWorker<B, C, I, E, SO, S, CAW> wher
                 match msg {
                     BftmlChannelMsg::GossipMsgOutgoing(msg) => {
                         // send it to gossip network
-                        let topic = make_topic();
+                        let topic = make_topic::<B>();
                         // multicast to network
-                        self.gossip_engine.gossip_message(topic, message, false);
+                        self.gossip_engine.gossip_message(topic, msg, false);
                     },
                     _ => {}
                 }
@@ -419,11 +436,15 @@ pub fn make_topic<B: BlockT>() -> B::Hash {
 
 /// Validator is needed by a gossip engine instance
 /// A validator for Bftml gossip messages.
-pub(super) struct GossipValidator<B: BlockT>;
+pub struct GossipValidator<B: BlockT> {
+    _b: PhantomData<B>,   
+}
 
-impl<B> GossipValidator<B> {
-    pub fn new() {
-        GossipValidator
+impl<B: BlockT> GossipValidator<B> {
+    pub fn new() -> GossipValidator<B> {
+        GossipValidator {
+            _b: PhantomData
+        }
     }
 }
 
@@ -432,7 +453,7 @@ impl<B> GossipValidator<B> {
 /// And we need only implement method validate() here.
 impl<B: BlockT> sc_network_gossip::Validator<B> for GossipValidator<B> {
     /// New peer is connected.
-    fn new_peer(&self, _context: &mut dyn ValidatorContext<B>, _who: &PeerId, _roles: Roles) {
+    fn new_peer(&self, _context: &mut dyn ValidatorContext<B>, _who: &PeerId, _roles: ObservedRole) {
     }
 
     /// New connection is dropped.
@@ -449,7 +470,7 @@ impl<B: BlockT> sc_network_gossip::Validator<B> for GossipValidator<B> {
         // now, we should create a topic for message
         // XXX: we'd better to create unique topic for each round
         // but now, we can create a fixed topic to test.
-        let topic = make_topic();
+        let topic = make_topic::<B>();
 
         // And we return ProcessAndKeep variant to test
 	    // Message should be stored and propagated under given topic.
@@ -473,11 +494,11 @@ impl<B: BlockT> sc_network_gossip::Validator<B> for GossipValidator<B> {
 //
 // Stuff must be implmented: Verifier, BlockImport, ImportQueue
 //
-pub struct BftmlVerifier<B: Block> {
+pub struct BftmlVerifier<B: BlockT> {
 	_marker: PhantomData<B>,
 }
 
-impl<B: Block> BftmlVerifier<B> {
+impl<B: BlockT> BftmlVerifier<B> {
 	pub fn new() -> Self {
 		Self { _marker: PhantomData }
 	}
@@ -506,13 +527,13 @@ impl<B: Block> BftmlVerifier<B> {
 	}
 }
 
-impl<B: Block> Verifier<B> for BftmlVerifier<B> {
+impl<B: BlockT> Verifier<B> for BftmlVerifier<B> {
     fn verify(
         &mut self,
         origin: BlockOrigin,
-        header: Block::Header,
+        header: B::Header,
         justification: Option<Justification>,
-        mut body: Option<Vec<Block::Extrinsic>>,
+        mut body: Option<Vec<B::Extrinsic>>,
     ) -> Result<(BlockImportParams<B, ()>, Option<Vec<(CacheKeyId, Vec<u8>)>>), String> {
 		let hash = header.hash();
 		let (checked_header, seal) = self.check_header(header)?;
@@ -528,16 +549,16 @@ impl<B: Block> Verifier<B> for BftmlVerifier<B> {
 }
 
 
-pub struct BftmlBlockImport<B: Block, C, I, S> {
+pub struct BftmlBlockImport<B: BlockT, C, I, S> {
     client: Arc<C>,
     inner: I,
     select_chain: Option<S>,
     inherent_data_providers: sp_inherents::InherentDataProviders,
-    check_inherents_after: <<B as Block>::Header as Header>::Number,
+    check_inherents_after: <<B as BlockT>::Header as HeaderT>::Number,
     imported_block_tx: UnboundedSender<BftProposal>,
 }
 
-impl<B: Block, C, I, S> Clone for BftmlBlockImport<B, C, I, S> {
+impl<B: BlockT, C, I: Clone, S: Clone> Clone for BftmlBlockImport<B, C, I, S> {
     fn clone(&self) -> Self {
         BftmlBlockImport {
             client: self.client.clone(),
@@ -552,11 +573,12 @@ impl<B: Block, C, I, S> Clone for BftmlBlockImport<B, C, I, S> {
 
 impl<B, C, I, S> BftmlBlockImport<B, C, I, S>
 where
-    B: Block,
+    B: BlockT,
     C: ProvideRuntimeApi<B> + Send + Sync + HeaderBackend<B> + AuxStore + ProvideCache<B> + BlockOf,
     C::Api: BlockBuilderApi<B, Error = sp_blockchain::Error>,
     I: BlockImport<B, Transaction = sp_api::TransactionFor<C, B>> + Send + Sync,
     I::Error: Into<ConsensusError>,
+	S: SelectChain<B> + Clone + 'static,
 {
     pub fn new(
         client: Arc<C>,
@@ -579,6 +601,7 @@ where
 	fn check_inherents(
 		&self,
 		block: B,
+        block_id: BlockId<B>,
 		inherent_data: InherentData,
 		timestamp_now: u64,
 	) -> Result<(), Error<B>> {
@@ -589,6 +612,7 @@ where
 		}
 
 		let inherent_res = self.client.runtime_api().check_inherents(
+            &block_id,
 			block,
 			inherent_data,
 		).map_err(Error::Client)?;
@@ -604,7 +628,7 @@ where
 
 						Ok(())
 					},
-					Some(InherentError::Other(e)) => Err(Error::Runtime(e)),
+					Some(InherentError::Other(e)) => Err(Error::Runtime),
 					None => Err(Error::CheckInherents(
 						self.inherent_data_providers.error_to_string(&i, &e)
 					)),
@@ -622,7 +646,7 @@ where
     C::Api: BlockBuilderApi<B, Error = sp_blockchain::Error>,
     I: BlockImport<B, Transaction = sp_api::TransactionFor<C, B>> + Send + Sync,
     I::Error: Into<ConsensusError>,
-	S: SelectChain<B>,
+	S: SelectChain<B> + 'static,
 {
 	type Error = ConsensusError;
 	type Transaction = sp_api::TransactionFor<C, B>;
@@ -647,6 +671,7 @@ where
 			None => self.client.info().best_hash,
 		};
 
+        let parent_hash = *block.header.parent_hash();
 		if let Some(inner_body) = block.body.take() {
 			let inherent_data = self.inherent_data_providers
 				.create_inherent_data().map_err(|e| e.into_string())?;
@@ -656,6 +681,7 @@ where
 
 			self.check_inherents(
 				check_block.clone(),
+                BlockId::Hash(parent_hash),
 				inherent_data,
 				timestamp_now
 			)?;
@@ -680,7 +706,7 @@ where
 		}
 
         // TODO: convert type BlockImportParams to BftProposal to pass to upper level
-        let bft_proposal = BftProposal; 
+        let bft_proposal = BftProposal{}; 
 
         // Send imported block to imported_block_rx, which was polled in the BftmlWorker.
         self.imported_block_tx.unbounded_send(bft_proposal);
@@ -716,7 +742,7 @@ pub fn make_import_queue<B, Transaction>(
 	spawner: &impl sp_core::traits::SpawnNamed,
 	registry: Option<&Registry>,
 ) -> Result<BftmlImportQueue<B, Transaction>, ConsensusError> where
-	B: Block,
+	B: BlockT,
 	Transaction: Send + Sync + 'static,
 {
 	register_bftml_inherent_data_provider(&inherent_data_providers)?;
@@ -740,6 +766,7 @@ pub fn make_import_queue<B, Transaction>(
 // gen module, including all generating methods about
 // ===============
 pub mod gen {
+    use super::*;
 
     pub fn gossip_msg_channels() -> (
         UnboundedSender<BftmlChannelMsg>,
@@ -769,19 +796,19 @@ pub mod gen {
         (ap_tx, ap_rx)
     }
 
-    pub fn give_proposal_channel() -> (UnboundedSender<BlockImportParams>, UnboundedReceiver<BlockImportParams>) {
+    pub fn give_proposal_channel() -> (UnboundedSender<BftProposal>, UnboundedReceiver<BftProposal>) {
         let (gp_tx, gp_rx) = mpsc::unbounded();
 
         (gp_tx, gp_rx)
     }
 
-    pub fn imported_block_channel() -> (UnboundedSender<BlockImportParams>, UnboundedReceiver<BlockImportParams>) {
+    pub fn imported_block_channel() -> (UnboundedSender<BftProposal>, UnboundedReceiver<BftProposal>) {
         let (imported_block_tx, imported_block_rx) = mpsc::unbounded();
 
         (imported_block_tx, imported_block_rx)
     }
 
-    pub fn<B, H> gossip_engine(network: Arc<NetworkService<B, H>>) -> GossipEngine<B> 
+    pub fn gossip_engine<B, H>(network: Arc<NetworkService<B, H>>) -> GossipEngine<B> 
         where B: BlockT,
               H: sc_network::ExHashT,
 
@@ -805,7 +832,7 @@ pub mod gen {
         gossip_engine
     }
 
-    pub fn<B> gossip_incoming_end(&gossip_engine: GossipEngine<B>, topic: B::Hash) -> Receiver<GossipMsgArrived> 
+    pub fn gossip_incoming_end<B>(gossip_engine: &GossipEngine<B>, topic: B::Hash) -> Receiver<GossipMsgArrived> 
         where B: BlockT,
     {
         let gossip_incoming_end = gossip_engine.messages_for(topic);

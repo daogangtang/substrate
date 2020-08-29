@@ -1011,7 +1011,7 @@ pub mod key_types {
 	/// A key type ID useful for tests.
 	pub const DUMMY: KeyTypeId = KeyTypeId(*b"dumy");
 	/// A key type for BFTML
-	pub const DUMMY: KeyTypeId = KeyTypeId(*b"bftm");
+	pub const BFTML: KeyTypeId = KeyTypeId(*b"bftm");
 }
 
 #[cfg(test)]

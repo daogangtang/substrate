@@ -182,7 +182,6 @@ pub struct BftmlWorker<B: BlockT, C: ProvideRuntimeApi<B>, E, SO, S, CAW, H: ExH
 impl<B, C, E, SO, S, CAW, H> BftmlWorker<B, C, E, SO, S, CAW, H> where
     B: BlockT + Clone + Eq,
 	C: HeaderBackend<B> + AuxStore + ProvideRuntimeApi<B> + 'static,
-    //I: BlockImport<B>,
     E: Environment<B> + Send + Sync,
     E::Proposer: Proposer<B, Transaction = sp_api::TransactionFor<C, B>>,
     E::Error: std::fmt::Debug,

@@ -14,7 +14,7 @@ use codec::{Encode, Decode, Codec};
 use sp_core::{Blake2Hasher, H256, Pair};
 use sp_runtime::{
     generic::{BlockId, Digest, DigestItem},
-    traits::{Block as BlockT, Header as HeaderT, Hash as HashT, DigestItemFor, Zero},
+    traits::{Block as BlockT, Header as HeaderT, Hash as HashT, DigestItemFor, Zero, BlakeTwo256},
     Justification, ConsensusEngineId,
 };
 use sp_consensus::{
@@ -120,10 +120,17 @@ impl<B: BlockT> std::convert::From<Error<B>> for ConsensusError {
 }
 
 // struct to send to caller layer
+#[derive(Debug, PartialEq, Eq, Encode, Decode, Clone)]
 pub struct BftProposal {
     // TODO: ...   
 }
 
+impl BftProposal {
+    pub fn hash(&self) -> H256 {
+        BlakeTwo256::hash(&[1,2,3,4,5,6,7,8])
+    }
+
+}
 
 // Bft consensus middle layer channel messages
 pub enum BftmlChannelMsg {
@@ -782,7 +789,7 @@ pub mod gen {
         (ap_tx, ap_rx)
     }
 
-    pub fn give_proposal_channel() -> (UnboundedSender<BftProposal>, UnboundedReceiver<BftProposal>) {
+    pub fn give_proposal_channel() -> (UnboundedSender<BftmlChannelMsg>, UnboundedReceiver<BftmlChannelMsg>) {
         let (gp_tx, gp_rx) = mpsc::unbounded();
 
         (gp_tx, gp_rx)

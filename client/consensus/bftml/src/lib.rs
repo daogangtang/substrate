@@ -119,17 +119,42 @@ impl<B: BlockT> std::convert::From<Error<B>> for ConsensusError {
 	}
 }
 
-// struct to send to caller layer
-#[derive(Debug, PartialEq, Eq, Encode, Decode, Clone)]
-pub struct BftProposal {
-    // TODO: ...   
+// make it be a byte serialization
+type OpaqueHash = Vec<u8>;
+
+/// Abstraction over a block header for a substrate chain.
+#[derive(PartialEq, Eq, Clone, Encode, Decode, Debug)]
+pub struct OpaqueHeader {
+	/// The block number.
+	pub number: u64,
+	/// The parent hash.
+	pub parent_hash: OpaqueHash,,
+	/// The state trie merkle root
+	pub state_root: OpaqueHash,
+	/// The merkle root of the extrinsics.
+	pub extrinsics_root: OpaqueHash,
+	// A chain-specific digest of data useful for light clients or referencing auxiliary data.
+	//pub digest: Digest<Hash>,
 }
+
+type OpaqueExtrinsic = Vec<u8>;
+
+/// Abstraction over a substrate block.
+#[derive(PartialEq, Eq, Clone, Encode, Decode, Debug)]
+pub struct OpaqueBlock {
+	/// The block header.
+	pub header: OpaqueHeader,
+	/// The accompanying extrinsics.
+	pub extrinsics: Vec<OpaqueExtrinsic>,
+}
+
+// struct to send to caller layer
+type BftProposal = OpaqueBlock;
 
 impl BftProposal {
     pub fn hash(&self) -> H256 {
         BlakeTwo256::hash(&[1,2,3,4,5,6,7,8])
     }
-
 }
 
 // Bft consensus middle layer channel messages

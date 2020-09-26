@@ -146,16 +146,18 @@ pub struct OpaqueBlock {
 	pub header: OpaqueHeader,
 	/// The accompanying extrinsics.
 	pub extrinsics: Vec<OpaqueExtrinsic>,
+    // a calculated hash for upper level usage
+    pub calculated_block_hash: OpaqueHash,
 }
 
 // struct to send to caller layer
 type BftProposal = OpaqueBlock;
 
-impl BftProposal {
-    pub fn hash(&self) -> H256 {
-        BlakeTwo256::hash(&[1,2,3,4,5,6,7,8])
-    }
-}
+// impl BftProposal {
+//     pub fn hash(&self) -> H256 {
+//         BlakeTwo256::hash(&[1,2,3,4,5,6,7,8])
+//     }
+// }
 
 // Bft consensus middle layer channel messages
 pub enum BftmlChannelMsg {
@@ -167,7 +169,7 @@ pub enum BftmlChannelMsg {
     AskProposal(u32),
     GiveProposal(BftProposal),
     // commit this block
-    CommitBlock(BftProposal),
+    CommitBlock(OpaqueHash),
 }
 
 type GossipMsgArrived = TopicNotification;
@@ -385,7 +387,6 @@ impl<B, C, E, SO, S, CAW, H> Future for BftmlWorker<B, C, E, SO, S, CAW, H> wher
             Poll::Ready(Some(msg)) => {
                 if let BftmlChannelMsg::AskProposal(authority_index) = msg {
                     // mint block
-                    // TODO: params from self
                     worker.make_proposal(authority_index);
                 }
             },
@@ -433,8 +434,12 @@ impl<B, C, E, SO, S, CAW, H> Future for BftmlWorker<B, C, E, SO, S, CAW, H> wher
         // receive ask proposal directive from upper layer
         match Stream::poll_next(Pin::new(&mut worker.cb_rx), cx) {
             Poll::Ready(Some(msg)) => {
-                if let BftmlChannelMsg::CommitBlock(bft_proposal) = msg {
-                    // TODO: finalize this block
+                if let BftmlChannelMsg::CommitBlock(block_hash) = msg {
+                    // here, block_hash is Vec<u8>, convert it to local Hash type
+                    let local_hash = B::Hash::from_slice(&block_hash[..]);
+
+                    // TODO: finalize this block, using block hash
+                    worker.client.finalize_block(BlockId::Hash(local_hash), None, false).unwrap();
                 }
             },
             _ => {}
@@ -724,7 +729,29 @@ where
 		}
 
         // TODO: convert type BlockImportParams to BftProposal to pass to upper level
-        let bft_proposal = BftProposal{}; 
+        // let bft_proposal = BftProposal{}; 
+        let num = block.header.number() as u64;
+        let parent_hash_vec = block.header.parent_hash().as_bytes().to_vec();
+        let state_root_vec = block.header.state_root().as_bytes().to_vec();
+        let extrinsics_root_vec = block.header.extrinsics_root().as_bytes().to_vec();
+        let opaque_header = OpaqueHeader {
+            number: num,
+            parent_hash: parent_hash_vec,
+            state_root: state_root_vec,
+            extrinsics_root: extrinsics_root_vec,
+        };
+        
+        let opaque_extrinsics_vec: Vec<OpaqueExtrinsic> = block.body
+            .and_then(|ext_vec| ext_vec.into_iter()
+                      .map(|ext| ext.encode()).collect());
+
+        let calculated_block_hash = block.hash().as_bytes().to_vec();;
+
+        let bft_proposal = BftProposal {
+            header: opaque_header,
+            extrinsics: opaque_extrinsics_vec,
+            calculated_block_hash
+        };
 
         // Send imported block to imported_block_rx, which was polled in the BftmlWorker.
         self.imported_block_tx.unbounded_send(bft_proposal);

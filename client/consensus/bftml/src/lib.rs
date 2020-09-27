@@ -32,7 +32,7 @@ use sp_blockchain::{
 use sp_api::{ApiExt, ProvideRuntimeApi};
 use sp_timestamp::{InherentError, TimestampInherentData};
 use sc_client_api::{
-    BlockOf,
+    BlockOf, Finalizer,
     backend::{AuxStore, Backend},
     call_executor::CallExecutor,
     BlockchainEvents, ProvideUncles,
@@ -126,9 +126,9 @@ type OpaqueHash = Vec<u8>;
 #[derive(PartialEq, Eq, Clone, Encode, Decode, Debug)]
 pub struct OpaqueHeader {
 	/// The block number.
-	pub number: u64,
+	pub number: Vec<u8>,
 	/// The parent hash.
-	pub parent_hash: OpaqueHash,,
+	pub parent_hash: OpaqueHash,
 	/// The state trie merkle root
 	pub state_root: OpaqueHash,
 	/// The merkle root of the extrinsics.
@@ -151,13 +151,14 @@ pub struct OpaqueBlock {
 }
 
 // struct to send to caller layer
-type BftProposal = OpaqueBlock;
+pub type BftProposal = OpaqueBlock;
 
-// impl BftProposal {
-//     pub fn hash(&self) -> H256 {
-//         BlakeTwo256::hash(&[1,2,3,4,5,6,7,8])
-//     }
-// }
+
+#[derive(Clone, Debug)]
+pub enum BftmlInnerMsg<B: BlockT> {
+    BftProposal(BftProposal),
+    BlockHash(B::Hash)
+}
 
 // Bft consensus middle layer channel messages
 pub enum BftmlChannelMsg {
@@ -177,7 +178,7 @@ type GossipMsgArrived = TopicNotification;
 //
 // Core bft consensus middle layer worker
 //
-pub struct BftmlWorker<B: BlockT, C: ProvideRuntimeApi<B>, E, SO, S, CAW, H: ExHashT> {
+pub struct BftmlWorker<B: BlockT, C: ProvideRuntimeApi<B>, E, SO, S, CAW, H: ExHashT, BD> {
     // hold a ref to substrate client
     client: Arc<C>,
     // hold a ref to substrate block import instance
@@ -193,7 +194,7 @@ pub struct BftmlWorker<B: BlockT, C: ProvideRuntimeApi<B>, E, SO, S, CAW, H: ExH
     gossip_incoming_end: Receiver<GossipMsgArrived>,
 
     // imported block channel rx, from block import handle
-    imported_block_rx: UnboundedReceiver<BftProposal>,
+    imported_block_rx: UnboundedReceiver<BftmlInnerMsg<B>>,
 
     // substrate to consensus engine channel tx
     tc_tx: UnboundedSender<BftmlChannelMsg>,
@@ -210,12 +211,18 @@ pub struct BftmlWorker<B: BlockT, C: ProvideRuntimeApi<B>, E, SO, S, CAW, H: ExH
     select_chain: Option<S>,
     inherent_data_providers: InherentDataProviders,
     can_author_with: CAW,
+    _backend: PhantomData<BD>,
+
+    // XXX: keep current block hash in this structure, because we can't convert Vec<u8> to 
+    // B::Hash 
+    current_block_hash: Option<B::Hash>,
 }
 
 
-impl<B, C, E, SO, S, CAW, H> BftmlWorker<B, C, E, SO, S, CAW, H> where
+impl<B, C, E, SO, S, CAW, H, BD> BftmlWorker<B, C, E, SO, S, CAW, H, BD> where
     B: BlockT + Clone + Eq,
-	C: HeaderBackend<B> + AuxStore + ProvideRuntimeApi<B> + 'static,
+	C: HeaderBackend<B> + AuxStore + ProvideRuntimeApi<B> + Finalizer<B, BD> + 'static,
+    BD: Backend<B>,
     E: Environment<B> + Send + Sync,
     E::Proposer: Proposer<B, Transaction = sp_api::TransactionFor<C, B>>,
     E::Error: std::fmt::Debug,
@@ -230,7 +237,7 @@ impl<B, C, E, SO, S, CAW, H> BftmlWorker<B, C, E, SO, S, CAW, H> where
         block_import: BoxBlockImport<B, sp_api::TransactionFor<C, B>>,
         proposer_factory: E,
         network: Arc<NetworkService<B, H>>,
-        imported_block_rx: UnboundedReceiver<BftProposal>,
+        imported_block_rx: UnboundedReceiver<BftmlInnerMsg<B>>,
         tc_tx: UnboundedSender<BftmlChannelMsg>,
         ts_rx: UnboundedReceiver<BftmlChannelMsg>,
         cb_rx: UnboundedReceiver<BftmlChannelMsg>,
@@ -240,7 +247,7 @@ impl<B, C, E, SO, S, CAW, H> BftmlWorker<B, C, E, SO, S, CAW, H> where
         select_chain: Option<S>,
         inherent_data_providers: InherentDataProviders,
         can_author_with: CAW,
-    ) -> BftmlWorker<B, C, E, SO, S, CAW, H> {
+    ) -> BftmlWorker<B, C, E, SO, S, CAW, H, BD> {
 
         // sync_oracle is actually a network clone
         let mut gossip_engine = crate::gen::gossip_engine(network.clone());
@@ -264,6 +271,8 @@ impl<B, C, E, SO, S, CAW, H> BftmlWorker<B, C, E, SO, S, CAW, H> where
             select_chain,
             inherent_data_providers,
             can_author_with,
+            _backend: PhantomData,
+            current_block_hash: None,
         }
     }
 
@@ -360,10 +369,11 @@ impl<B, C, E, SO, S, CAW, H> BftmlWorker<B, C, E, SO, S, CAW, H> where
 }
 
 
-impl<B, C, E, SO, S, CAW, H> Future for BftmlWorker<B, C, E, SO, S, CAW, H> where
+impl<B, C, E, SO, S, CAW, H, BD> Future for BftmlWorker<B, C, E, SO, S, CAW, H, BD> where
     B: BlockT + Clone + Eq,
-	C: HeaderBackend<B> + AuxStore + ProvideRuntimeApi<B> + 'static,
-    //I: BlockImport<B>,
+    B::Hash: std::marker::Unpin,
+	C: HeaderBackend<B> + AuxStore + ProvideRuntimeApi<B> + Finalizer<B, BD> + 'static,
+    BD: Backend<B> + Send + std::marker::Unpin,
     E: Environment<B> + Send + Sync + std::marker::Unpin,
     E::Proposer: Proposer<B, Transaction = sp_api::TransactionFor<C, B>>,
     E::Error: std::fmt::Debug,
@@ -395,9 +405,16 @@ impl<B, C, E, SO, S, CAW, H> Future for BftmlWorker<B, C, E, SO, S, CAW, H> wher
 
         // when proposal is ready, give this proposal to upper layer
         match Stream::poll_next(Pin::new(&mut worker.imported_block_rx), cx) {
-            Poll::Ready(Some(bft_proposal)) => {
-                // forward it with gp_tx
-                worker.gp_tx.unbounded_send(BftmlChannelMsg::GiveProposal(bft_proposal));
+            Poll::Ready(Some(bft_inner_msg)) => {
+                match bft_inner_msg {
+                    BftmlInnerMsg::BftProposal(bft_proposal) => {
+                        // forward it with gp_tx
+                        worker.gp_tx.unbounded_send(BftmlChannelMsg::GiveProposal(bft_proposal));
+                    }
+                    BftmlInnerMsg::BlockHash(block_hash) => {
+                        worker.current_block_hash = Some(block_hash);
+                    }
+                }
             },
             _ => {}
         }
@@ -434,12 +451,21 @@ impl<B, C, E, SO, S, CAW, H> Future for BftmlWorker<B, C, E, SO, S, CAW, H> wher
         // receive ask proposal directive from upper layer
         match Stream::poll_next(Pin::new(&mut worker.cb_rx), cx) {
             Poll::Ready(Some(msg)) => {
-                if let BftmlChannelMsg::CommitBlock(block_hash) = msg {
+                if let BftmlChannelMsg::CommitBlock(_block_hash) = msg {
                     // here, block_hash is Vec<u8>, convert it to local Hash type
-                    let local_hash = B::Hash::from_slice(&block_hash[..]);
+                    // let local_hash = <B as BlockT>::Hash::from_slice(&block_hash[..]);
+                    // TODO: replace concrete H256 to the associated type of BlockT, but right now
+                    // don't find a method to it.
+                    //let local_hash = H256::from_slice(&block_hash[..]);
+                    //let local_hash: <B as BlockT>::Hash = Decode::decode(&mut &block_hash).unwrap();
+                    //let local_hash = unsafe {std::mem::transmute::<H256, <B as BlockT>::Hash>(local_hash)};
+                    // XXX: this is a wiered way to go around the conversion failure
+                    if worker.current_block_hash.is_some() {
+                        let block_hash = worker.current_block_hash.take().unwrap();
+                        // finalize this block, using block hash
+                        worker.client.finalize_block(BlockId::Hash(block_hash), None, false).unwrap();
+                    }
 
-                    // TODO: finalize this block, using block hash
-                    worker.client.finalize_block(BlockId::Hash(local_hash), None, false).unwrap();
                 }
             },
             _ => {}
@@ -578,7 +604,7 @@ pub struct BftmlBlockImport<B: BlockT, C, I, S> {
     select_chain: Option<S>,
     inherent_data_providers: sp_inherents::InherentDataProviders,
     check_inherents_after: <<B as BlockT>::Header as HeaderT>::Number,
-    imported_block_tx: UnboundedSender<BftProposal>,
+    imported_block_tx: UnboundedSender<BftmlInnerMsg<B>>,
 }
 
 impl<B: BlockT, C, I: Clone, S: Clone> Clone for BftmlBlockImport<B, C, I, S> {
@@ -609,7 +635,7 @@ where
         select_chain: Option<S>,
         inherent_data_providers: sp_inherents::InherentDataProviders,
         check_inherents_after: <<B as BlockT>::Header as HeaderT>::Number,
-        imported_block_tx: UnboundedSender<BftProposal>,
+        imported_block_tx: UnboundedSender<BftmlInnerMsg<B>>,
     ) -> Self {
         BftmlBlockImport {
             client,
@@ -728,12 +754,11 @@ where
 			block.fork_choice = Some(ForkChoiceStrategy::Custom(true));
 		}
 
-        // TODO: convert type BlockImportParams to BftProposal to pass to upper level
-        // let bft_proposal = BftProposal{}; 
-        let num = block.header.number() as u64;
-        let parent_hash_vec = block.header.parent_hash().as_bytes().to_vec();
-        let state_root_vec = block.header.state_root().as_bytes().to_vec();
-        let extrinsics_root_vec = block.header.extrinsics_root().as_bytes().to_vec();
+        // TODO: num has only encode method to convert to Vec<u8>, not a method to u64
+        let num = (*block.header.number()).encode();
+        let parent_hash_vec = block.header.parent_hash().as_ref().to_vec();
+        let state_root_vec = block.header.state_root().as_ref().to_vec();
+        let extrinsics_root_vec = block.header.extrinsics_root().as_ref().to_vec();
         let opaque_header = OpaqueHeader {
             number: num,
             parent_hash: parent_hash_vec,
@@ -741,11 +766,16 @@ where
             extrinsics_root: extrinsics_root_vec,
         };
         
-        let opaque_extrinsics_vec: Vec<OpaqueExtrinsic> = block.body
-            .and_then(|ext_vec| ext_vec.into_iter()
-                      .map(|ext| ext.encode()).collect());
+        let mut opaque_extrinsics_vec: Vec<OpaqueExtrinsic> = vec![];
+        let body = block.body.clone();
+        if body.is_some() {
+            for item in body.unwrap() {
+                opaque_extrinsics_vec.push(item.encode());
+            }
+        }
 
-        let calculated_block_hash = block.hash().as_bytes().to_vec();;
+        let block_hash = block.header.hash();
+        let calculated_block_hash = block_hash.as_ref().to_vec();
 
         let bft_proposal = BftProposal {
             header: opaque_header,
@@ -754,7 +784,8 @@ where
         };
 
         // Send imported block to imported_block_rx, which was polled in the BftmlWorker.
-        self.imported_block_tx.unbounded_send(bft_proposal);
+        self.imported_block_tx.unbounded_send(BftmlInnerMsg::BftProposal(bft_proposal));
+        self.imported_block_tx.unbounded_send(BftmlInnerMsg::BlockHash(block_hash));
 
 		self.inner.import_block(block, new_cache).map_err(Into::into)
     }
@@ -847,7 +878,7 @@ pub mod gen {
         (gp_tx, gp_rx)
     }
 
-    pub fn imported_block_channel() -> (UnboundedSender<BftProposal>, UnboundedReceiver<BftProposal>) {
+    pub fn imported_block_channel<B: BlockT>() -> (UnboundedSender<BftmlInnerMsg<B>>, UnboundedReceiver<BftmlInnerMsg<B>>) {
         let (imported_block_tx, imported_block_rx) = mpsc::unbounded();
 
         (imported_block_tx, imported_block_rx)
